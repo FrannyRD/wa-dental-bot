@@ -45,15 +45,14 @@ app.use(
 // =========================
 const sessions = new Map();
 function getSession(userId) {
-  // ✅ CAMBIO: añadimos memoria de slots + selección + datos parciales
-  if (!sessions.has(userId))
+  if (!sessions.has(userId)) {
     sessions.set(userId, {
       messages: [],
-      lastSlots: [],
-      pickedSlot: null,
-      patientName: null,
-      patientPhone: null,
+      state: "IDLE", // IDLE | BOOKED | RESCHEDULE
+      lastAppointment: null, // {appointment_id,start,end,service,patient_name,phone}
+      lastSlots: [], // last get_available_slots results (for numeric selection)
     });
+  }
   return sessions.get(userId);
 }
 
@@ -81,14 +80,7 @@ function defaultWorkHours() {
 }
 
 function defaultServiceDuration() {
-  return {
-    limpieza: 45,
-    caries: 45,
-    ortodoncia: 30,
-    blanqueamiento: 60,
-    evaluacion: 30,
-    otro: 30,
-  };
+  return { limpieza: 45, caries: 45, ortodoncia: 30, blanqueamiento: 60, evaluacion: 30, otro: 30 };
 }
 
 function verifyMetaSignature(req) {
@@ -97,10 +89,7 @@ function verifyMetaSignature(req) {
   if (!signature) return false;
   const expected =
     "sha256=" +
-    crypto
-      .createHmac("sha256", META_APP_SECRET)
-      .update(req.rawBody || Buffer.from(""))
-      .digest("hex");
+    crypto.createHmac("sha256", META_APP_SECRET).update(req.rawBody || Buffer.from("")).digest("hex");
   try {
     return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
   } catch {
@@ -112,64 +101,125 @@ function addMinutes(date, minutes) {
   return new Date(date.getTime() + minutes * 60000);
 }
 
-function toISO(date) {
-  return date.toISOString();
-}
-
 function parseHM(hm) {
   const [h, m] = hm.split(":").map((n) => parseInt(n, 10));
   return { h, m };
 }
 
-function weekdayKey(date) {
-  // JS: 0=Sun..6=Sat
-  const d = date.getDay();
+// ---- Timezone helpers (fix hora RD) ----
+function fixedOffsetForTZ() {
+  // RD no usa DST: siempre -04:00
+  if (CLINIC_TIMEZONE === "America/Santo_Domingo") return "-04:00";
+  // fallback: si cambias TZ a otra, usa Z (puedes mejorar luego con luxon)
+  return "Z";
+}
+
+function normalizeISO(input, kind = "from") {
+  // kind: "from" -> 00:00 ; "to" -> 23:59
+  const offset = fixedOffsetForTZ();
+  const s = String(input || "").trim();
+  if (!s) throw new Error("Missing date input");
+
+  const hasTZ = /([zZ]|[+-]\d{2}:\d{2})$/.test(s);
+
+  // YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const time = kind === "to" ? "23:59:00" : "00:00:00";
+    return `${s}T${time}${offset === "Z" ? "Z" : offset}`;
+  }
+
+  // Has time but no timezone suffix
+  if (/^\d{4}-\d{2}-\d{2}T/.test(s) && !hasTZ) {
+    return `${s}${offset === "Z" ? "Z" : offset}`;
+  }
+
+  // Already ISO with TZ
+  return s;
+}
+
+function ymdInClinicTZ(date) {
+  // en-CA => YYYY-MM-DD
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: CLINIC_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
+function weekdayKeyFromYMD(ymd) {
+  // ymd in clinic tz; compute weekday in UTC date (safe for weekday when using pure ymd)
+  const [yy, mm, dd] = ymd.split("-").map((n) => parseInt(n, 10));
+  const utc = new Date(Date.UTC(yy, mm - 1, dd, 12, 0, 0)); // noon avoids edge cases
+  const d = utc.getUTCDay(); // 0=Sun..6=Sat
   return ["sun", "mon", "tue", "wed", "thu", "fri", "sat"][d];
 }
 
+function addDaysYMD(ymd, days) {
+  const [yy, mm, dd] = ymd.split("-").map((n) => parseInt(n, 10));
+  const utc = new Date(Date.UTC(yy, mm - 1, dd, 12, 0, 0));
+  utc.setUTCDate(utc.getUTCDate() + days);
+  const yyyy = utc.getUTCFullYear();
+  const m2 = String(utc.getUTCMonth() + 1).padStart(2, "0");
+  const d2 = String(utc.getUTCDate()).padStart(2, "0");
+  return `${yyyy}-${m2}-${d2}`;
+}
+
+function toISOInClinicTZFromYMD(ymd, hm) {
+  const offset = fixedOffsetForTZ();
+  const suffix = offset === "Z" ? "Z" : offset;
+  return `${ymd}T${hm}:00${suffix}`;
+}
+
+function formatInClinicTZ(iso) {
+  const d = new Date(iso);
+  return new Intl.DateTimeFormat("es-DO", {
+    timeZone: CLINIC_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).format(d);
+}
+
+function formatTimeInClinicTZ(iso) {
+  const d = new Date(iso);
+  return new Intl.DateTimeFormat("es-DO", {
+    timeZone: CLINIC_TIMEZONE,
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).format(d);
+}
+
+function formatDateInClinicTZ(iso) {
+  const d = new Date(iso);
+  return new Intl.DateTimeFormat("es-DO", {
+    timeZone: CLINIC_TIMEZONE,
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  }).format(d);
+}
+
 function formatSlotLine(slot, i) {
-  // slot.start is ISO
-  const dt = new Date(slot.start);
-  const hh = String(dt.getHours()).padStart(2, "0");
-  const mm = String(dt.getMinutes()).padStart(2, "0");
-  return `${i + 1}) ${hh}:${mm} (${slot.service})`;
+  const t = formatTimeInClinicTZ(slot.start);
+  return `${i + 1}) ${t}`;
 }
 
-// ✅ CAMBIO: detecta si un texto parece teléfono
-function looksLikePhone(s) {
-  const digits = (s || "").replace(/\D/g, "");
-  return digits.length >= 10 && digits.length <= 15;
-}
-
-// ✅ CAMBIO: encontrar slot por número (1..8) o por hora (9, 9:00, 09:15)
-function pickSlotFromUserText(userText, slots) {
-  const t = (userText || "").trim().toLowerCase();
-  if (!slots?.length) return null;
-
-  // por índice: "1", "2", ...
-  const asInt = parseInt(t, 10);
-  if (!Number.isNaN(asInt) && asInt >= 1 && asInt <= slots.length) {
-    return slots[asInt - 1];
-  }
-
-  // por hora: "9", "9:00", "09:15"
-  const m = t.match(/(\d{1,2})(?::(\d{2}))?/);
-  if (m) {
-    const hh = m[1].padStart(2, "0");
-    const mm = (m[2] ?? "00").padStart(2, "0");
-    const target = `${hh}:${mm}`;
-
-    const found = slots.find((s) => {
-      const d = new Date(s.start);
-      const sh = String(d.getHours()).padStart(2, "0");
-      const sm = String(d.getMinutes()).padStart(2, "0");
-      return `${sh}:${sm}` === target;
-    });
-
-    return found || null;
-  }
-
+function looksLikeChoiceNumber(text) {
+  const t = String(text || "").trim();
+  if (!/^\d{1,2}$/.test(t)) return null;
+  const n = parseInt(t, 10);
+  if (n >= 1 && n <= 20) return n;
   return null;
+}
+
+function looksLikePhone(text) {
+  const digits = String(text || "").replace(/\D/g, "");
+  return digits.length >= 9;
 }
 
 // =========================
@@ -221,7 +271,6 @@ async function getBusyRanges(calendar, timeMinISO, timeMaxISO) {
   });
 
   const busy = fb.data.calendars?.[GOOGLE_CALENDAR_ID]?.busy || [];
-  // busy ranges: [{start,end}]
   return busy.map((b) => ({
     start: new Date(b.start),
     end: new Date(b.end),
@@ -233,52 +282,65 @@ function overlaps(aStart, aEnd, bStart, bEnd) {
 }
 
 function buildCandidateSlots({ service, fromISO, toISO, durationMin }) {
+  // fromISO/toISO ya normalizados con offset
   const from = new Date(fromISO);
   const to = new Date(toISO);
 
+  const startYMD = ymdInClinicTZ(from);
+  const endYMD = ymdInClinicTZ(to);
+
   const slots = [];
+  let ymd = startYMD;
+  let guard = 0;
 
-  // iterate day by day
-  for (let day = new Date(from); day <= to; day = addMinutes(day, 24 * 60)) {
-    const key = weekdayKey(day);
+  while (true) {
+    guard++;
+    if (guard > 400) break; // safety
+
+    const key = weekdayKeyFromYMD(ymd);
     const wh = WORK_HOURS[key];
-    if (!wh) continue;
+    if (wh) {
+      const dayStartISO = toISOInClinicTZFromYMD(ymd, wh.start);
+      const dayEndISO = toISOInClinicTZFromYMD(ymd, wh.end);
 
-    const { h: sh, m: sm } = parseHM(wh.start);
-    const { h: eh, m: em } = parseHM(wh.end);
+      const dayStart = new Date(dayStartISO);
+      const dayEnd = new Date(dayEndISO);
 
-    const dayStart = new Date(day);
-    dayStart.setHours(sh, sm, 0, 0);
+      // clamp to [from,to]
+      let cursor = new Date(Math.max(dayStart.getTime(), from.getTime()));
+      cursor.setSeconds(0, 0);
 
-    const dayEnd = new Date(day);
-    dayEnd.setHours(eh, em, 0, 0);
-
-    // window must be within range [from,to]
-    let cursor = new Date(Math.max(dayStart.getTime(), from.getTime()));
-    cursor.setSeconds(0, 0);
-
-    while (addMinutes(cursor, durationMin) <= dayEnd && cursor <= to) {
-      const end = addMinutes(cursor, durationMin);
-      slots.push({
-        slot_id: "slot_" + cursor.getTime(), // deterministic id
-        service: service || "evaluacion",
-        start: cursor.toISOString(),
-        end: end.toISOString(),
-      });
-      cursor = addMinutes(cursor, SLOT_STEP_MIN);
+      while (addMinutes(cursor, durationMin) <= dayEnd && cursor <= to) {
+        const end = addMinutes(cursor, durationMin);
+        slots.push({
+          slot_id: "slot_" + cursor.getTime(),
+          service: service || "evaluacion",
+          start: cursor.toISOString(), // instante real
+          end: end.toISOString(),
+          local_time: formatTimeInClinicTZ(cursor.toISOString()),
+          local_date: formatDateInClinicTZ(cursor.toISOString()),
+        });
+        cursor = addMinutes(cursor, SLOT_STEP_MIN);
+      }
     }
+
+    if (ymd === endYMD) break;
+    ymd = addDaysYMD(ymd, 1);
   }
 
   return slots;
 }
 
-async function getAvailableSlotsTool({ service, from, to }) {
+async function getAvailableSlotsTool({ service, from, to }, session) {
   const calendar = getCalendarClient();
 
-  const durationMin = SERVICE_DURATION[service] || SERVICE_DURATION["otro"] || 30;
+  const normFrom = normalizeISO(from, "from");
+  const normTo = normalizeISO(to, "to");
 
-  const busyRanges = await getBusyRanges(calendar, from, to);
-  const candidates = buildCandidateSlots({ service, fromISO: from, toISO: to, durationMin });
+  const durationMin = SERVICE_DURATION?.[service] || SERVICE_DURATION?.["otro"] || 30;
+
+  const busyRanges = await getBusyRanges(calendar, normFrom, normTo);
+  const candidates = buildCandidateSlots({ service, fromISO: normFrom, toISO: normTo, durationMin });
 
   const free = candidates.filter((c) => {
     const cs = new Date(c.start);
@@ -286,8 +348,12 @@ async function getAvailableSlotsTool({ service, from, to }) {
     return !busyRanges.some((b) => overlaps(cs, ce, b.start, b.end));
   });
 
-  // limita para WhatsApp (no spamear)
-  return free.slice(0, 8);
+  const limited = free.slice(0, 8);
+
+  // guarda para selección por número
+  if (session) session.lastSlots = limited;
+
+  return limited;
 }
 
 // =========================
@@ -295,20 +361,21 @@ async function getAvailableSlotsTool({ service, from, to }) {
 // =========================
 async function bookAppointmentTool({ patient_name, phone, slot_id, service, notes, slot_start, slot_end }) {
   const calendar = getCalendarClient();
-
   if (!slot_start || !slot_end) throw new Error("Missing slot_start/slot_end");
+
+  const cleanPhone = String(phone || "").replace(/\D/g, "");
 
   const event = await calendar.events.insert({
     calendarId: GOOGLE_CALENDAR_ID,
     requestBody: {
       summary: `Cita - ${service} - ${patient_name}`,
       location: CLINIC_ADDRESS || undefined,
-      description: `Paciente: ${patient_name}\nTel: ${phone}\nServicio: ${service}\nNotas: ${notes || ""}\nSlotId: ${slot_id}`,
+      description: `Paciente: ${patient_name}\nTel: ${cleanPhone}\nServicio: ${service}\nNotas: ${notes || ""}\nSlotId: ${slot_id}`,
       start: { dateTime: slot_start, timeZone: CLINIC_TIMEZONE },
       end: { dateTime: slot_end, timeZone: CLINIC_TIMEZONE },
       extendedProperties: {
         private: {
-          wa_phone: phone,
+          wa_phone: cleanPhone,
           patient_name,
           service,
           slot_id,
@@ -325,14 +392,16 @@ async function bookAppointmentTool({ patient_name, phone, slot_id, service, note
     end: slot_end,
     service,
     patient_name,
-    phone, // ✅ ÚNICO CAMBIO: devolver phone para que se muestre en confirmación
+    phone: cleanPhone,
   };
 }
 
 async function rescheduleAppointmentTool({ appointment_id, new_slot_id, new_start, new_end }) {
   const calendar = getCalendarClient();
-
   if (!new_start || !new_end) throw new Error("Missing new_start/new_end");
+
+  const existing = await calendar.events.get({ calendarId: GOOGLE_CALENDAR_ID, eventId: appointment_id });
+  const prevPriv = existing.data.extendedProperties?.private || {};
 
   const updated = await calendar.events.patch({
     calendarId: GOOGLE_CALENDAR_ID,
@@ -342,6 +411,7 @@ async function rescheduleAppointmentTool({ appointment_id, new_slot_id, new_star
       end: { dateTime: new_end, timeZone: CLINIC_TIMEZONE },
       extendedProperties: {
         private: {
+          ...prevPriv,
           slot_id: new_slot_id,
           reminder24hSent: "false",
           reminder2hSent: "false",
@@ -350,7 +420,12 @@ async function rescheduleAppointmentTool({ appointment_id, new_slot_id, new_star
     },
   });
 
-  return { ok: true, appointment_id: updated.data.id, new_start, new_end };
+  return {
+    ok: true,
+    appointment_id: updated.data.id,
+    new_start,
+    new_end,
+  };
 }
 
 async function cancelAppointmentTool({ appointment_id, reason }) {
@@ -378,55 +453,63 @@ async function cancelAppointmentTool({ appointment_id, reason }) {
 }
 
 async function handoffToHumanTool({ summary }) {
-  // Aquí puedes integrar Chatwoot/CRM/Notificación admin
   return { ok: true, routed: true, summary };
 }
 
 // =========================
 // OpenAI: tool calling
 // =========================
-async function callOpenAI({ userId, userText, userPhone }) {
-  const session = getSession(userId);
-
-  // ✅ CAMBIO: si el usuario elige un slot por número u hora, lo guardamos y pedimos nombre (sin recalcular)
-  const picked = pickSlotFromUserText(userText, session.lastSlots);
-  if (picked) {
-    session.pickedSlot = picked;
-    session.patientName = null;
-    session.patientPhone = null;
-
-    const dt = new Date(picked.start);
-    const hh = String(dt.getHours()).padStart(2, "0");
-    const mm = String(dt.getMinutes()).padStart(2, "0");
-
-    const msgText = `Perfecto ✅ Queda seleccionado el horario ${hh}:${mm}.\nAhora indícame tu *nombre completo* para reservar.`;
-    session.messages.push({ role: "assistant", content: msgText });
-    return msgText;
+async function callOpenAI({ session, userId, userText, userPhone }) {
+  // Enrich: si el usuario manda un número y tenemos slots, tradúcelo a elección explícita
+  const n = looksLikeChoiceNumber(userText);
+  if (n && session.lastSlots?.length) {
+    const chosen = session.lastSlots[n - 1];
+    if (chosen) {
+      userText = `El usuario eligió la opción #${n}. Slot elegido: start=${chosen.start}, end=${chosen.end}, local_time=${chosen.local_time}, local_date=${chosen.local_date}, service=${chosen.service}.`;
+    }
   }
 
-  // ✅ CAMBIO: pasamos "Fecha/hora actual" para que “mañana” sea mañana real
-  const nowStr = new Date().toLocaleString("es-DO", { timeZone: CLINIC_TIMEZONE });
+  // Contexto post-cita (para que NO reinicie flujo)
+  const appt = session.lastAppointment;
 
   const system = {
     role: "system",
     content: `
 Eres un asistente de WhatsApp de ${CLINIC_NAME} para agendar citas.
+
 Reglas:
 - No diagnostiques ni des consejo médico. Solo agenda y triage.
 - Urgencias (dolor severo, sangrado fuerte, fiebre, trauma, hinchazón intensa): llama a handoff_to_human.
 - NO inventes horarios. Solo ofrece slots de get_available_slots.
 - Para reservar, debes llamar a book_appointment con slot_start y slot_end EXACTOS del slot elegido.
-- Mantén respuestas cortas, claras y con opciones.
+- Para reprogramar una cita existente, usa get_available_slots y luego reschedule_appointment con new_start/new_end EXACTOS.
+- Para cancelar una cita existente, usa cancel_appointment con appointment_id.
+- Mantén respuestas cortas, claras y con opciones. Evita pedir datos repetidos.
+- Si el usuario dice "listo/ok/gracias" después de confirmar, responde amable y ofrece reprogramar/cancelar/nueva cita.
 
 Servicios válidos: limpieza, caries, ortodoncia, blanqueamiento, evaluacion, otro.
 Zona horaria: ${CLINIC_TIMEZONE}.
-Fecha/hora actual: ${nowStr}.
-Tel usuario: ${userPhone}.
+Dirección: ${CLINIC_ADDRESS || "No especificada"}.
+Tel usuario (WhatsApp): ${userPhone}.
+
+${
+  appt
+    ? `CITA ACTUAL (ya reservada):
+- appointment_id: ${appt.appointment_id}
+- servicio: ${appt.service}
+- fecha/hora: ${formatInClinicTZ(appt.start)} (hora local)
+- nombre: ${appt.patient_name}
+- teléfono: ${appt.phone}
+
+Si el usuario quiere "reprogramar" o "cancelar", se refiere a esta cita por defecto.
+Si el usuario quiere "otra" / "nueva" cita adicional, procede a agendar una nueva sin borrar el appointment_id anterior.`
+    : ``
+}
 `,
   };
 
   session.messages.push({ role: "user", content: userText });
-  const messages = [system, ...session.messages].slice(-14);
+  const messages = [system, ...session.messages].slice(-18);
 
   const tools = [
     {
@@ -531,28 +614,52 @@ Tel usuario: ${userPhone}.
   if (msg?.tool_calls?.length) {
     const toolResults = [];
     let lastSlots = null;
+    let bookedResult = null;
+    let rescheduledResult = null;
+    let cancelledResult = null;
 
     for (const tc of msg.tool_calls) {
       const name = tc.function.name;
       const args = JSON.parse(tc.function.arguments || "{}");
 
       if (name === "get_available_slots") {
-        const slots = await getAvailableSlotsTool(args);
+        const slots = await getAvailableSlotsTool(args, session);
         lastSlots = slots;
-
-        // ✅ CAMBIO: guardar slots para que el usuario elija y NO se recalculen
-        session.lastSlots = slots;
-
         toolResults.push({
           tool_call_id: tc.id,
           role: "tool",
           name,
-          content: JSON.stringify({ slots }),
+          content: JSON.stringify({
+            slots: slots.map((s) => ({
+              slot_id: s.slot_id,
+              service: s.service,
+              start: s.start,
+              end: s.end,
+              local_time: s.local_time,
+              local_date: s.local_date,
+              display: `${s.local_date} - ${s.local_time}`,
+            })),
+            hint: "Muestra opciones enumeradas (1..n) y pide que respondan con el número elegido.",
+          }),
         });
       }
 
       if (name === "book_appointment") {
         const booked = await bookAppointmentTool(args);
+
+        // guarda estado post-cita
+        session.state = "BOOKED";
+        session.lastAppointment = {
+          appointment_id: booked.appointment_id,
+          start: booked.start,
+          end: booked.end,
+          service: booked.service,
+          patient_name: booked.patient_name,
+          phone: booked.phone,
+        };
+
+        bookedResult = booked;
+
         toolResults.push({
           tool_call_id: tc.id,
           role: "tool",
@@ -562,7 +669,22 @@ Tel usuario: ${userPhone}.
       }
 
       if (name === "reschedule_appointment") {
+        // si el modelo no envía appointment_id pero tenemos uno en sesión, úsalo
+        if (!args.appointment_id && session.lastAppointment?.appointment_id) {
+          args.appointment_id = session.lastAppointment.appointment_id;
+        }
+
         const out = await rescheduleAppointmentTool(args);
+
+        // actualiza cita en sesión
+        if (session.lastAppointment?.appointment_id === out.appointment_id) {
+          session.lastAppointment.start = out.new_start;
+          session.lastAppointment.end = out.new_end;
+          session.state = "BOOKED";
+        }
+
+        rescheduledResult = out;
+
         toolResults.push({
           tool_call_id: tc.id,
           role: "tool",
@@ -572,7 +694,18 @@ Tel usuario: ${userPhone}.
       }
 
       if (name === "cancel_appointment") {
+        if (!args.appointment_id && session.lastAppointment?.appointment_id) {
+          args.appointment_id = session.lastAppointment.appointment_id;
+        }
+
         const out = await cancelAppointmentTool(args);
+
+        // limpia estado
+        session.state = "IDLE";
+        session.lastAppointment = null;
+
+        cancelledResult = out;
+
         toolResults.push({
           tool_call_id: tc.id,
           role: "tool",
@@ -604,10 +737,42 @@ Tel usuario: ${userPhone}.
 
     let finalText = resp2.data.choices?.[0]?.message?.content?.trim() || "";
 
-    // Si devolvió slots y no los formateó “bonito”, lo ayudamos:
-    if (lastSlots?.length && /slots/i.test(JSON.stringify(toolResults)) && finalText.length < 5) {
-      const lines = lastSlots.map((s, i) => formatSlotLine(s, i)).join("\n");
-      finalText = `Estos son los horarios disponibles:\n${lines}\n\nRespóndeme con el número (1,2,3...) o con la hora (ej: 9:15).`;
+    // UX fallback: si devolvió slots y no formateó
+    if (lastSlots?.length && finalText.length < 5) {
+      const lines = lastSlots.map((s, i) => `${i + 1}. ${s.local_time}`).join("\n");
+      finalText = `Estos son los horarios disponibles (${lastSlots[0]?.local_date}):\n\n${lines}\n\nResponde con el número (1,2,3...) para elegir.`;
+    }
+
+    // Mensaje bonito y consistente si se reservó
+    if (bookedResult) {
+      const dt = formatInClinicTZ(bookedResult.start);
+      const endT = formatTimeInClinicTZ(bookedResult.end);
+
+      finalText =
+        `✅ *Cita reservada con éxito*\n\n` +
+        `🦷 Servicio: *${bookedResult.service}*\n` +
+        `📅 Fecha/Hora: *${dt}* (hasta ${endT})\n` +
+        `👤 Paciente: *${bookedResult.patient_name}*\n` +
+        `📞 Teléfono: *${bookedResult.phone}*\n` +
+        (CLINIC_ADDRESS ? `📍 Dirección: ${CLINIC_ADDRESS}\n` : ``) +
+        `\n¿Deseas *reprogramar*, *cancelar* o agendar *otra* cita?`;
+    }
+
+    // Mensaje bonito si se reprogramó
+    if (rescheduledResult?.ok && session.lastAppointment) {
+      const dt = formatInClinicTZ(session.lastAppointment.start);
+      const endT = formatTimeInClinicTZ(session.lastAppointment.end);
+
+      finalText =
+        `✅ *Cita reprogramada*\n\n` +
+        `🦷 Servicio: *${session.lastAppointment.service}*\n` +
+        `📅 Nueva fecha/hora: *${dt}* (hasta ${endT})\n` +
+        `\n¿Necesitas *cancelar* o agendar *otra* cita?`;
+    }
+
+    // Mensaje bonito si se canceló
+    if (cancelledResult?.ok) {
+      finalText = `✅ Listo, tu cita fue *cancelada*.\n\nSi deseas agendar una nueva, dime el servicio (limpieza, caries, ortodoncia, blanqueamiento, evaluación).`;
     }
 
     session.messages.push({ role: "assistant", content: finalText });
@@ -643,155 +808,80 @@ app.post("/webhook", async (req, res) => {
     const msg = value?.messages?.[0];
     if (!msg) return res.sendStatus(200);
 
-    // ✅ CAMBIO (ya lo tenías): Ignorar eventos que no son mensajes de texto reales
-    if (!msg.from || !msg.text?.body) return res.sendStatus(200);
+    // Ignorar eventos que no son mensajes de texto
+    if (!msg.from) return res.sendStatus(200);
 
     const from = msg.from;
-    const text = msg.text.body;
-
     const session = getSession(from);
 
-    // ✅ CAMBIO: si ya hay un slot seleccionado, completamos nombre/teléfono y reservamos ESE slot (sin recalcular)
-    if (session.pickedSlot) {
-      // 1) Si llega teléfono
-      if (!session.patientPhone && looksLikePhone(text)) {
-        session.patientPhone = text.replace(/\D/g, "");
+    const text = (msg.text?.body || "").trim();
+    if (!text) return res.sendStatus(200);
 
-        // ✅ Si ya tenemos nombre, reservamos YA
-        if (session.patientName) {
-          const s = session.pickedSlot;
+    // --------- Estado post-cita: no reiniciar flujo ---------
+    if (session.state === "BOOKED" && session.lastAppointment) {
+      const cleaned = text.toLowerCase();
 
-          const booked = await bookAppointmentTool({
-            patient_name: session.patientName,
-            phone: session.patientPhone,
-            slot_id: s.slot_id,
-            service: s.service || "evaluacion",
-            notes: "",
-            slot_start: s.start,
-            slot_end: s.end,
-          });
-
-          const dt = new Date(booked.start).toLocaleString("es-DO", { timeZone: CLINIC_TIMEZONE });
-
-          // limpiar estado
-          session.pickedSlot = null;
-          session.lastSlots = [];
-          session.patientName = null;
-          session.patientPhone = null;
-
-          await sendWhatsAppText(
-            from,
-            `✅ He reservado tu cita:\n\nServicio: ${booked.service}\nFecha/Hora: ${dt}\nNombre: ${booked.patient_name}\nTeléfono: ${booked.phone || ""}\n\n¿Deseas reprogramar o cancelar?`
-          );
-
-          return res.sendStatus(200);
-        }
-
-        // si no hay nombre todavía, entonces sí lo pedimos
-        await sendWhatsAppText(from, "Gracias. Ahora indícame tu *nombre completo* para reservar.");
-        return res.sendStatus(200);
-      }
-
-      // 2) Si llega nombre
-      if (!session.patientName && !looksLikePhone(text)) {
-        session.patientName = text.trim();
-
-        // ✅ Si ya tenemos teléfono, reservamos YA
-        if (session.patientPhone) {
-          const s = session.pickedSlot;
-
-          const booked = await bookAppointmentTool({
-            patient_name: session.patientName,
-            phone: session.patientPhone,
-            slot_id: s.slot_id,
-            service: s.service || "evaluacion",
-            notes: "",
-            slot_start: s.start,
-            slot_end: s.end,
-          });
-
-          const dt = new Date(booked.start).toLocaleString("es-DO", { timeZone: CLINIC_TIMEZONE });
-
-          // limpiar estado
-          session.pickedSlot = null;
-          session.lastSlots = [];
-          session.patientName = null;
-          session.patientPhone = null;
-
-          await sendWhatsAppText(
-            from,
-            `✅ He reservado tu cita:\n\nServicio: ${booked.service}\nFecha/Hora: ${dt}\nNombre: ${booked.patient_name}\nTeléfono: ${booked.phone || ""}\n\n¿Deseas reprogramar o cancelar?`
-          );
-
-          return res.sendStatus(200);
-        }
-
+      // 1) Confirmación/ack
+      if (/^(listo|ok|okay|gracias|perfecto|dale|bien|👍)$/i.test(text)) {
         await sendWhatsAppText(
           from,
-          "Gracias. Ahora envíame tu *número de teléfono* (ej: 829XXXXXXX) para completar la reserva."
+          "✅ Perfecto. Tu cita ya quedó registrada.\n\nSi deseas *reprogramar*, *cancelar* o agendar *otra* cita, escríbelo por aquí."
         );
         return res.sendStatus(200);
       }
 
-      // 3) Si ya tenemos ambos (fallback)
-      if (session.patientName && session.patientPhone) {
-        const s = session.pickedSlot;
-
-        const booked = await bookAppointmentTool({
-          patient_name: session.patientName,
-          phone: session.patientPhone,
-          slot_id: s.slot_id,
-          service: s.service || "evaluacion",
-          notes: "",
-          slot_start: s.start,
-          slot_end: s.end,
+      // 2) Cancelar
+      if (cleaned.includes("cancel")) {
+        await cancelAppointmentTool({
+          appointment_id: session.lastAppointment.appointment_id,
+          reason: "Solicitado por el paciente (WhatsApp)",
         });
-
-        const dt = new Date(booked.start).toLocaleString("es-DO", { timeZone: CLINIC_TIMEZONE });
-
-        session.pickedSlot = null;
-        session.lastSlots = [];
-        session.patientName = null;
-        session.patientPhone = null;
+        session.state = "IDLE";
+        session.lastAppointment = null;
 
         await sendWhatsAppText(
           from,
-          `✅ He reservado tu cita:\n\nServicio: ${booked.service}\nFecha/Hora: ${dt}\nNombre: ${booked.patient_name}\n\n¿Deseas reprogramar o cancelar?`
+          "✅ Listo, tu cita fue *cancelada*.\n\nSi deseas agendar una nueva, dime el servicio (limpieza, caries, ortodoncia, blanqueamiento, evaluación)."
         );
-
         return res.sendStatus(200);
       }
 
-      // Si el usuario manda ambos en un solo mensaje (ej: "Franny 829...")
-      if (!session.patientName || !session.patientPhone) {
-        const digits = text.replace(/\D/g, "");
-        if (digits.length >= 10 && digits.length <= 15) {
-          session.patientPhone = digits;
-          // quita el teléfono del texto para dejar nombre
-          const nameGuess = text.replace(digits, "").trim();
-          if (nameGuess) session.patientName = nameGuess;
-        }
-        if (!session.patientName) {
-          await sendWhatsAppText(from, "Solo me falta tu *nombre completo* para reservar.");
-          return res.sendStatus(200);
-        }
-        if (!session.patientPhone) {
-          await sendWhatsAppText(from, "Solo me falta tu *número de teléfono* para reservar.");
-          return res.sendStatus(200);
-        }
+      // 3) Reprogramar
+      if (cleaned.includes("reprogram") || cleaned.includes("cambiar") || cleaned.includes("mover")) {
+        session.state = "RESCHEDULE";
+        await sendWhatsAppText(
+          from,
+          "Perfecto ✅ ¿Para qué fecha te gustaría *reprogramar*?\n\nEjemplos: “mañana”, “viernes”, o “del 10 al 15”."
+        );
+        return res.sendStatus(200);
+      }
 
-        // si ya quedaron ambos, la siguiente iteración lo reservará
+      // 4) Nueva cita adicional
+      if (cleaned.includes("otra") || cleaned.includes("nueva") || cleaned.includes("adicional") || cleaned.includes("segunda")) {
+        // mantenemos lastAppointment para historial, pero dejamos que la IA agende otra
+        session.state = "IDLE";
       }
     }
 
-    // flujo normal (OpenAI + tools)
-    const reply = await callOpenAI({ userId: from, userText: text, userPhone: from });
+    // Si venimos de RESCHEDULE y el usuario da fechas, la IA debe entender intención
+    // (Le damos pista en el texto sin romper la conversación)
+    let enrichedText = text;
+    if (session.state === "RESCHEDULE" && session.lastAppointment) {
+      enrichedText =
+        `El usuario quiere REPROGRAMAR la cita existente. appointment_id=${session.lastAppointment.appointment_id}. ` +
+        `La cita actual es ${formatInClinicTZ(session.lastAppointment.start)}. ` +
+        `Mensaje del usuario: "${text}"`;
+      // mantenemos state BOOKED, porque la IA hará reschedule_appointment
+      session.state = "BOOKED";
+    }
+
+    const reply = await callOpenAI({ session, userId: from, userText: enrichedText, userPhone: from });
     await sendWhatsAppText(from, reply);
 
-    res.sendStatus(200);
+    return res.sendStatus(200);
   } catch (e) {
     console.error("Webhook error:", e?.message || e);
-    res.sendStatus(200);
+    return res.sendStatus(200);
   }
 });
 
@@ -805,9 +895,7 @@ async function reminderLoop() {
     const calendar = getCalendarClient();
     const now = new Date();
     const in26h = addMinutes(now, 26 * 60);
-    const in3h = addMinutes(now, 3 * 60);
 
-    // Próximas ~26h (para 24h)
     const list = await calendar.events.list({
       calendarId: GOOGLE_CALENDAR_ID,
       timeMin: now.toISOString(),
@@ -830,7 +918,7 @@ async function reminderLoop() {
       const start = new Date(startISO);
       const minutesToStart = Math.round((start.getTime() - now.getTime()) / 60000);
 
-      // 24h reminder (envuelve 24h +/- 30 min)
+      // 24h reminder (24h +/- 30 min)
       if (
         REMINDER_24H &&
         minutesToStart <= 24 * 60 &&
@@ -839,9 +927,7 @@ async function reminderLoop() {
       ) {
         await sendWhatsAppText(
           phone,
-          `Recordatorio 🦷: tienes cita mañana a las ${String(start.getHours()).padStart(2, "0")}:${String(
-            start.getMinutes()
-          ).padStart(2, "0")} en ${CLINIC_NAME}.\n\nResponde:\n1) Confirmar\n2) Reprogramar\n3) Cancelar`
+          `Recordatorio 🦷: tienes cita *mañana* a las *${formatTimeInClinicTZ(startISO)}* en *${CLINIC_NAME}*.\n\nResponde:\n1) Confirmar\n2) Reprogramar\n3) Cancelar`
         );
         await calendar.events.patch({
           calendarId: GOOGLE_CALENDAR_ID,
@@ -856,9 +942,9 @@ async function reminderLoop() {
       if (REMINDER_2H && minutesToStart <= 120 && minutesToStart >= 105 && priv.reminder2hSent !== "true") {
         await sendWhatsAppText(
           phone,
-          `Recordatorio 🦷: tu cita es hoy a las ${String(start.getHours()).padStart(2, "0")}:${String(
-            start.getMinutes()
-          ).padStart(2, "0")} en ${CLINIC_NAME}.\nDirección: ${CLINIC_ADDRESS}\n\nResponde:\n1) Confirmar\n2) Reprogramar\n3) Cancelar`
+          `Recordatorio 🦷: tu cita es *hoy* a las *${formatTimeInClinicTZ(startISO)}* en *${CLINIC_NAME}*.\n` +
+            (CLINIC_ADDRESS ? `Dirección: ${CLINIC_ADDRESS}\n\n` : `\n`) +
+            `Responde:\n1) Confirmar\n2) Reprogramar\n3) Cancelar`
         );
         await calendar.events.patch({
           calendarId: GOOGLE_CALENDAR_ID,
@@ -881,5 +967,3 @@ setInterval(reminderLoop, 5 * 60 * 1000);
 // Start
 // =========================
 app.listen(PORT, () => console.log(`Bot running on :${PORT}`));
-
-
