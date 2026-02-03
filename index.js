@@ -652,49 +652,111 @@ app.post("/webhook", async (req, res) => {
 
     // ✅ CAMBIO: si ya hay un slot seleccionado, completamos nombre/teléfono y reservamos ESE slot (sin recalcular)
     if (session.pickedSlot) {
-      // Si llega teléfono primero
-      if (!session.patientPhone && looksLikePhone(text)) {
-        session.patientPhone = text.replace(/\D/g, "");
-        await sendWhatsAppText(from, "Gracias. Ahora indícame tu *nombre completo* para reservar.");
-        return res.sendStatus(200);
-      }
+  // 1) Si llega teléfono
+  if (!session.patientPhone && looksLikePhone(text)) {
+    session.patientPhone = text.replace(/\D/g, "");
 
-      // Si llega nombre primero
-      if (!session.patientName && !looksLikePhone(text)) {
-        session.patientName = text.trim();
-        await sendWhatsAppText(from, "Gracias. Ahora envíame tu *número de teléfono* (ej: 829XXXXXXX) para completar la reserva.");
-        return res.sendStatus(200);
-      }
+    // ✅ Si ya tenemos nombre, reservamos YA
+    if (session.patientName) {
+      const s = session.pickedSlot;
 
-      // Si ya tenemos ambos (en cualquier orden), reservamos
-      if (session.patientName && session.patientPhone) {
-        const s = session.pickedSlot;
+      const booked = await bookAppointmentTool({
+        patient_name: session.patientName,
+        phone: session.patientPhone,
+        slot_id: s.slot_id,
+        service: s.service || "evaluacion",
+        notes: "",
+        slot_start: s.start,
+        slot_end: s.end,
+      });
 
-        const booked = await bookAppointmentTool({
-          patient_name: session.patientName,
-          phone: session.patientPhone,
-          slot_id: s.slot_id,
-          service: s.service || "evaluacion",
-          notes: "",
-          slot_start: s.start,
-          slot_end: s.end,
-        });
+      const dt = new Date(booked.start).toLocaleString("es-DO", { timeZone: CLINIC_TIMEZONE });
 
-        // limpiar estado para evitar doble reserva
-        session.pickedSlot = null;
-        session.lastSlots = [];
-        session.patientName = null;
-        session.patientPhone = null;
+      // limpiar estado
+      session.pickedSlot = null;
+      session.lastSlots = [];
+      session.patientName = null;
+      session.patientPhone = null;
 
-        const dt = new Date(booked.start).toLocaleString("es-DO", { timeZone: CLINIC_TIMEZONE });
+      await sendWhatsAppText(
+        from,
+        `✅ He reservado tu cita:\n\nServicio: ${booked.service}\nFecha/Hora: ${dt}\nNombre: ${booked.patient_name}\nTeléfono: ${booked.phone || ""}\n\n¿Deseas reprogramar o cancelar?`
+      );
 
-        await sendWhatsAppText(
-          from,
-          `✅ He reservado tu cita:\n\nServicio: ${booked.service}\nFecha/Hora: ${dt}\nNombre: ${booked.patient_name}\nTeléfono: ${session?.patientPhone || ""}\n\n¿Deseas reprogramar o cancelar?`
-        );
+      return res.sendStatus(200);
+    }
 
-        return res.sendStatus(200);
-      }
+    // si no hay nombre todavía, entonces sí lo pedimos
+    await sendWhatsAppText(from, "Gracias. Ahora indícame tu *nombre completo* para reservar.");
+    return res.sendStatus(200);
+  }
+
+  // 2) Si llega nombre
+  if (!session.patientName && !looksLikePhone(text)) {
+    session.patientName = text.trim();
+
+    // ✅ Si ya tenemos teléfono, reservamos YA
+    if (session.patientPhone) {
+      const s = session.pickedSlot;
+
+      const booked = await bookAppointmentTool({
+        patient_name: session.patientName,
+        phone: session.patientPhone,
+        slot_id: s.slot_id,
+        service: s.service || "evaluacion",
+        notes: "",
+        slot_start: s.start,
+        slot_end: s.end,
+      });
+
+      const dt = new Date(booked.start).toLocaleString("es-DO", { timeZone: CLINIC_TIMEZONE });
+
+      // limpiar estado
+      session.pickedSlot = null;
+      session.lastSlots = [];
+      session.patientName = null;
+      session.patientPhone = null;
+
+      await sendWhatsAppText(
+        from,
+        `✅ He reservado tu cita:\n\nServicio: ${booked.service}\nFecha/Hora: ${dt}\nNombre: ${booked.patient_name}\nTeléfono: ${booked.phone || ""}\n\n¿Deseas reprogramar o cancelar?`
+      );
+
+      return res.sendStatus(200);
+    }
+
+    await sendWhatsAppText(from, "Gracias. Ahora envíame tu *número de teléfono* (ej: 829XXXXXXX) para completar la reserva.");
+    return res.sendStatus(200);
+  }
+
+  // 3) Si ya tenemos ambos (fallback)
+  if (session.patientName && session.patientPhone) {
+    const s = session.pickedSlot;
+
+    const booked = await bookAppointmentTool({
+      patient_name: session.patientName,
+      phone: session.patientPhone,
+      slot_id: s.slot_id,
+      service: s.service || "evaluacion",
+      notes: "",
+      slot_start: s.start,
+      slot_end: s.end,
+    });
+
+    const dt = new Date(booked.start).toLocaleString("es-DO", { timeZone: CLINIC_TIMEZONE });
+
+    session.pickedSlot = null;
+    session.lastSlots = [];
+    session.patientName = null;
+    session.patientPhone = null;
+
+    await sendWhatsAppText(
+      from,
+      `✅ He reservado tu cita:\n\nServicio: ${booked.service}\nFecha/Hora: ${dt}\nNombre: ${booked.patient_name}\n\n¿Deseas reprogramar o cancelar?`
+    );
+
+    return res.sendStatus(200);
+  }
 
       // Si el usuario manda ambos en un solo mensaje (ej: "Franny 829...")
       if (!session.patientName || !session.patientPhone) {
