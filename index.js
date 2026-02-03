@@ -558,8 +558,11 @@ app.post("/webhook", async (req, res) => {
     const msg = value?.messages?.[0];
     if (!msg) return res.sendStatus(200);
 
+    // ✅ CAMBIO: Ignorar eventos que no son mensajes de texto reales (tests, estados, etc.)
+    if (!msg.from || !msg.text?.body) return res.sendStatus(200);
+
     const from = msg.from;
-    const text = msg.text?.body || "";
+    const text = msg.text.body;
 
     const reply = await callOpenAI({ userId: from, userText: text, userPhone: from });
     await sendWhatsAppText(from, reply);
@@ -570,6 +573,7 @@ app.post("/webhook", async (req, res) => {
     res.sendStatus(200);
   }
 });
+
 
 app.get("/", (req, res) => res.send("OK"));
 
