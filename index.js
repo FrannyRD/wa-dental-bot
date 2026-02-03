@@ -148,6 +148,40 @@ function weekdayKeyFromISOWeekday(isoWeekday) {
   return ["", "mon", "tue", "wed", "thu", "fri", "sat", "sun"][isoWeekday];
 }
 
+// NEW: detectar saludo para evitar doble respuesta
+function isGreeting(textNorm) {
+  const t = textNorm || "";
+  // saludos típicos (cortos)
+  const greetings = [
+    "hola",
+    "buen dia",
+    "buen día",
+    "buenos dias",
+    "buenos días",
+    "buenas",
+    "buenas tardes",
+    "buenas noches",
+    "saludos",
+    "hey",
+    "hi",
+  ];
+  const isOnlyGreeting =
+    greetings.some((g) => t === g || t.startsWith(g + " ")) ||
+    /^(hola+|buenas+)\b/.test(t);
+
+  // si trae intención de cita, no lo tratamos como “saludo simple”
+  const hasBookingIntent =
+    t.includes("cita") ||
+    t.includes("agendar") ||
+    t.includes("agenda") ||
+    t.includes("reservar") ||
+    t.includes("reserva") ||
+    t.includes("reprogram") ||
+    t.includes("cancel");
+
+  return isOnlyGreeting && !hasBookingIntent && t.length <= 40;
+}
+
 // ---- Timezone utilities ----
 function getZonedParts(date, timeZone) {
   const fmt = new Intl.DateTimeFormat("en-CA", {
@@ -599,26 +633,25 @@ function parseDateRangeFromText(userText) {
     return { from: from.toISOString(), to: to.toISOString(), label: "mañana" };
   }
 
-  // NEW: "la semana que viene" / "semana que viene"
+  // "la semana que viene"
   if (t.includes("semana que viene") || t.includes("la semana que viene") || t.includes("siguiente semana")) {
     const from = addLocalDaysUTC(startOfLocalDayUTC(new Date(), CLINIC_TIMEZONE), 1, CLINIC_TIMEZONE);
     const to = addLocalDaysUTC(from, 7, CLINIC_TIMEZONE);
     return { from: from.toISOString(), to: to.toISOString(), label: "la semana que viene" };
   }
 
-  // NEW: "en junio" / "junio"
+  // "en junio"
   for (const [mname, mnum] of Object.entries(MONTHS)) {
     if (t === mname || t.includes(`en ${mname}`) || t.includes(`para ${mname}`)) {
       const nowP = getZonedParts(new Date(), CLINIC_TIMEZONE);
       let year = nowP.year;
-      // si el mes ya pasó, ir al próximo año
       if (mnum < nowP.month) year += 1;
       const r = rangeForWholeMonth(year, mnum);
       return { ...r, label: mname };
     }
   }
 
-  // "el viernes" / "este jueves" / "proximo martes"
+  // "el viernes" / "proximo martes"
   for (const [name, iso] of Object.entries(DOW)) {
     if (t.includes(name)) {
       const isNext = t.includes("proximo") || t.includes("próximo") || t.includes("que viene") || t.includes("siguiente");
@@ -628,7 +661,7 @@ function parseDateRangeFromText(userText) {
     }
   }
 
-  // "14 de junio" (sin año => este año, si ya pasó => próximo año)
+  // "14 de junio"
   const m1 = t.match(/(\d{1,2})\s+de\s+([a-záéíóú]+)(\s+de\s+(\d{4}))?/);
   if (m1) {
     const day = parseInt(m1[1], 10);
@@ -855,7 +888,7 @@ Tel usuario: ${userPhone}.
           tool_call_id: tc.id,
           role: "tool",
           name,
-          content: JSON.stringify({ booked }),
+         content: JSON.stringify({ booked }),
         });
       }
 
@@ -983,12 +1016,32 @@ app.post("/webhook", async (req, res) => {
 
     if (!userText) return res.sendStatus(200);
 
-    // NEW: primer mensaje A/B + menú (solo una vez por sesión)
-    if (!session.greeted && session.state === "idle") {
+    // =========================
+    // FIX: evitar respuestas múltiples al saludar
+    // - Solo saluda (A/B + menú) si es un saludo simple y NO trae intención de cita
+    // - Y luego return inmediato para no seguir el flujo
+    // =========================
+    const detectedServiceEarly = detectServiceKeyFromUser(userText);
+    const detectedRangeEarly = parseDateRangeFromText(userText);
+    const hasEarlyIntent =
+      !!detectedServiceEarly ||
+      !!detectedRangeEarly ||
+      tNorm.includes("cita") ||
+      tNorm.includes("agendar") ||
+      tNorm.includes("reservar") ||
+      tNorm.includes("reprogram") ||
+      tNorm.includes("cancel");
+
+    if (!session.greeted && session.state === "idle" && isGreeting(tNorm) && !hasEarlyIntent) {
       session.greeted = true;
       await sendWhatsAppText(from, servicesEmojiText());
       await sendServicesList(from);
-      // Si justo escribió un servicio, seguimos (no retornamos)
+      return res.sendStatus(200);
+    }
+
+    // (Opcional: si quieres marcar greeted en el primer mensaje “no saludo” para no repetir luego)
+    if (!session.greeted && session.state === "idle") {
+      session.greeted = true;
     }
 
     // -------------------------
@@ -1160,7 +1213,6 @@ app.post("/webhook", async (req, res) => {
 
     // If service detected, try parse date
     if (serviceKey) {
-      // IMPORTANT: If they only selected service, ask for day
       const range = parseDateRangeFromText(userText);
 
       if (!range) {
@@ -1218,7 +1270,6 @@ app.post("/webhook", async (req, res) => {
         return res.sendStatus(200);
       }
 
-      // NEW: If they wrote something like "el viernes" but parse didn't catch (fallback)
       if (session.state === "await_day") {
         await sendWhatsAppText(
           from,
