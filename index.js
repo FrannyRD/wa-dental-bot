@@ -27,6 +27,16 @@ const SLOT_STEP_MIN = parseInt(process.env.SLOT_STEP_MIN || "15", 10);
 const REMINDER_24H = (process.env.REMINDER_24H || "1") === "1";
 const REMINDER_2H = (process.env.REMINDER_2H || "1") === "1";
 
+// ✅ NUEVO: Servicios (para botones + entendimiento por texto)
+const SERVICES = [
+  "Estética dental",
+  "Ortodoncia",
+  "Implantes",
+  "Urgencias",
+  "Limpiezas y prevención",
+  "Odontopediatría",
+];
+
 // =========================
 // Express (raw body for signature check)
 // =========================
@@ -45,19 +55,7 @@ app.use(
 // =========================
 const sessions = new Map();
 function getSession(userId) {
-  if (!sessions.has(userId)) {
-    sessions.set(userId, {
-      messages: [],
-      state: "idle", // idle | awaiting_slot | awaiting_name | awaiting_phone | post_appointment | awaiting_reschedule_slot
-      lastSlots: null,
-      pendingSlot: null,
-      pendingService: null,
-      pendingRange: null,
-      patientName: null,
-      patientPhone: null,
-      activeAppointment: null, // { appointment_id, start, end, service, patient_name, phone }
-    });
-  }
+  if (!sessions.has(userId)) sessions.set(userId, { messages: [] });
   return sessions.get(userId);
 }
 
@@ -84,19 +82,26 @@ function defaultWorkHours() {
   };
 }
 
+// ✅ Ajustado: duraciones para los nuevos servicios (mantengo fallback)
 function defaultServiceDuration() {
-  return { limpieza: 45, caries: 45, ortodoncia: 30, blanqueamiento: 60, evaluacion: 30, otro: 30 };
+  return {
+    "Estética dental": 60,
+    Ortodoncia: 30,
+    Implantes: 60,
+    Urgencias: 30,
+    "Limpiezas y prevención": 45,
+    Odontopediatría: 45,
+    Otro: 30,
+  };
 }
 
 function verifyMetaSignature(req) {
   if (!META_APP_SECRET) return true;
   const signature = req.get("X-Hub-Signature-256");
   if (!signature) return false;
-
   const expected =
     "sha256=" +
     crypto.createHmac("sha256", META_APP_SECRET).update(req.rawBody || Buffer.from("")).digest("hex");
-
   try {
     return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
   } catch {
@@ -108,178 +113,50 @@ function addMinutes(date, minutes) {
   return new Date(date.getTime() + minutes * 60000);
 }
 
+function toISO(date) {
+  return date.toISOString();
+}
+
 function parseHM(hm) {
   const [h, m] = hm.split(":").map((n) => parseInt(n, 10));
   return { h, m };
 }
 
-// ---------- Timezone-safe helpers (CLINIC_TIMEZONE) ----------
-function partsInTZ(date, timeZone) {
-  const dtf = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    hour12: false,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-  const parts = dtf.formatToParts(date);
-  const map = {};
-  for (const p of parts) map[p.type] = p.value;
-  return map;
-}
-
-function ymdInClinicTZ(date) {
-  const p = partsInTZ(date, CLINIC_TIMEZONE);
-  return `${p.year}-${p.month}-${p.day}`;
-}
-
-function addDaysYMD(ymd, days) {
-  const [Y, M, D] = ymd.split("-").map(Number);
-  const t = Date.UTC(Y, M - 1, D) + days * 86400000;
-  const d = new Date(t);
-  const yy = d.getUTCFullYear();
-  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  return `${yy}-${mm}-${dd}`;
-}
-
-function getTimeZoneOffsetMs(date, timeZone) {
-  // Offset = (time in TZ as UTC) - (real UTC time)
-  const p = partsInTZ(date, timeZone);
-  const asUTC = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second);
-  return asUTC - date.getTime();
-}
-
-function makeDateInTZ(ymd, hm, timeZone) {
-  const [Y, M, D] = ymd.split("-").map(Number);
-  const { h, m } = parseHM(hm);
-
-  // Start with a UTC guess, then correct with timezone offset at that instant
-  const utcGuess = new Date(Date.UTC(Y, M - 1, D, h, m, 0));
-  const offset = getTimeZoneOffsetMs(utcGuess, timeZone);
-  return new Date(utcGuess.getTime() - offset);
-}
-
-function toISOInClinicTZFromYMD(ymd, hm) {
-  return makeDateInTZ(ymd, hm, CLINIC_TIMEZONE).toISOString();
-}
-
-function formatInClinicTZ(iso) {
-  const dt = new Date(iso);
-  return new Intl.DateTimeFormat("es-DO", {
-    timeZone: CLINIC_TIMEZONE,
-    weekday: "long",
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-  }).format(dt);
-}
-
-function formatTimeInClinicTZ(iso) {
-  const dt = new Date(iso);
-  return new Intl.DateTimeFormat("es-DO", {
-    timeZone: CLINIC_TIMEZONE,
-    hour: "numeric",
-    minute: "2-digit",
-    hour12: true,
-  }).format(dt);
-}
-
-function weekdayKeyFromYMD(ymd) {
-  const noon = makeDateInTZ(ymd, "12:00", CLINIC_TIMEZONE);
-  const wd = new Intl.DateTimeFormat("en-US", { timeZone: CLINIC_TIMEZONE, weekday: "short" }).format(noon);
-  const map = { Sun: "sun", Mon: "mon", Tue: "tue", Wed: "wed", Thu: "thu", Fri: "fri", Sat: "sat" };
-  return map[wd] || "mon";
-}
-
-function ceilToStep(date, stepMin) {
-  const ms = date.getTime();
-  const stepMs = stepMin * 60000;
-  const rounded = Math.ceil(ms / stepMs) * stepMs;
-  return new Date(rounded);
-}
-
-function normalizeISO(input, kind = "from") {
-  if (!input) return null;
-  const s = String(input).trim();
-
-  // YYYY-MM-DD => start/end of day in clinic TZ
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
-    return kind === "to" ? toISOInClinicTZFromYMD(s, "23:59") : toISOInClinicTZFromYMD(s, "00:00");
-  }
-
-  // Otherwise try Date parse
-  const d = new Date(s);
-  if (!isNaN(d.getTime())) return d.toISOString();
-
-  return null;
-}
-
-function looksLikeThanks(text) {
-  return /^(ok|okay|listo|gracias|perfecto|dale|genial|bien|👍|✅)\b/i.test(text.trim());
-}
-
-function wantsCancel(text) {
-  return /\b(cancel(ar|a|o|ación)?|anular)\b/i.test(text);
-}
-
-function wantsReschedule(text) {
-  return /\b(reprogram(ar|a|o)?|mover|cambiar\s*(la\s*)?cita|reagendar)\b/i.test(text);
-}
-
-function wantsNewAppointment(text) {
-  return /\b(nueva\s*cita|agendar\s*otra|otra\s*cita|cita\s*nueva|agendar\s*nuevamente)\b/i.test(text);
-}
-
-function extractPhone(text) {
-  const digits = String(text || "").replace(/[^\d]/g, "");
-  if (digits.length >= 8) return digits;
-  return null;
-}
-
-function extractSlotChoice(text, slots) {
-  const t = String(text || "").trim();
-
-  // If user replies a number (1..n)
-  const n = parseInt(t, 10);
-  if (!isNaN(n) && n >= 1 && n <= slots.length) return slots[n - 1];
-
-  // If user replies hour like "10" or "10:00"
-  if (/^\d{1,2}(:\d{2})?$/.test(t)) {
-    const hm = t.includes(":") ? t : `${t}:00`;
-    const [hh, mm] = hm.split(":").map((x) => parseInt(x, 10));
-
-    for (const s of slots) {
-      const p = partsInTZ(new Date(s.start), CLINIC_TIMEZONE);
-      const sh = parseInt(p.hour, 10);
-      const sm = parseInt(p.minute, 10);
-      if (sh === hh && sm === mm) return s;
-    }
-  }
-
-  return null;
+function weekdayKey(date) {
+  // JS: 0=Sun..6=Sat
+  const d = date.getDay();
+  return ["sun", "mon", "tue", "wed", "thu", "fri", "sat"][d];
 }
 
 function formatSlotLine(slot, i) {
-  const startT = formatTimeInClinicTZ(slot.start);
-  const endT = formatTimeInClinicTZ(slot.end);
-  return `${i + 1}. ${startT} - ${endT}`;
+  // slot.start is ISO
+  const dt = new Date(slot.start);
+  const hh = String(dt.getHours()).padStart(2, "0");
+  const mm = String(dt.getMinutes()).padStart(2, "0");
+  return `${i + 1}) ${hh}:${mm} (${slot.service})`;
 }
 
-function prettyConfirmation(appt) {
-  return (
-    `✅ *Cita reservada*\n\n` +
-    `🦷 Servicio: *${appt.service}*\n` +
-    `👤 Nombre: *${appt.patient_name}*\n` +
-    `📞 Teléfono: *${appt.phone}*\n` +
-    `📅 Fecha: *${formatInClinicTZ(appt.start)}*\n` +
-    `⏰ Hora: *${formatTimeInClinicTZ(appt.start)}*\n` +
-    (CLINIC_ADDRESS ? `📍 Dirección: ${CLINIC_ADDRESS}\n` : "") +
-    `\n¿Deseas *reprogramar* o *cancelar*?`
-  );
+// ✅ NUEVO: normaliza servicio por botón o texto
+function normalizeService(input) {
+  const raw = String(input || "").trim();
+
+  // Viene de lista: "service:Ortodoncia"
+  if (raw.toLowerCase().startsWith("service:")) {
+    const chosen = raw.split(":").slice(1).join(":").trim();
+    if (SERVICES.includes(chosen)) return chosen;
+  }
+
+  const t = raw.toLowerCase();
+
+  // Sinónimos / escritura libre
+  if (/(limpieza|profilaxis|higiene|sarro|prevenci)/i.test(t)) return "Limpiezas y prevención";
+  if (/(brackets|ortodon|alineador|retenedor)/i.test(t)) return "Ortodoncia";
+  if (/(implante|tornillo|corona sobre implante)/i.test(t)) return "Implantes";
+  if (/(urgencia|emergenc|dolor fuerte|sangrado|golpe|trauma|hinchaz)/i.test(t)) return "Urgencias";
+  if (/(estet|carilla|blanquea|sonrisa|resina|diseño de sonrisa)/i.test(t)) return "Estética dental";
+  if (/(pediatr|niñ|infant|odontopedi)/i.test(t)) return "Odontopediatría";
+
+  return null;
 }
 
 // =========================
@@ -294,6 +171,37 @@ async function sendWhatsAppText(to, text) {
       to,
       type: "text",
       text: { body: text },
+    },
+    { headers: { Authorization: `Bearer ${WA_TOKEN}` } }
+  );
+}
+
+// ✅ NUEVO: Lista bonita de servicios (interactive list)
+async function sendWhatsAppServiceList(to) {
+  const url = `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`;
+
+  const rows = SERVICES.map((s) => ({
+    id: `service:${s}`,
+    title: s,
+    description: "",
+  }));
+
+  await axios.post(
+    url,
+    {
+      messaging_product: "whatsapp",
+      to,
+      type: "interactive",
+      interactive: {
+        type: "list",
+        header: { type: "text", text: "Nuestros servicios" },
+        body: { text: "Elige el servicio que necesitas 👇" },
+        footer: { text: "También puedes escribirlo (ej: limpieza, brackets, implantes)." },
+        action: {
+          button: "Ver servicios",
+          sections: [{ title: "Servicios disponibles", rows }],
+        },
+      },
     },
     { headers: { Authorization: `Bearer ${WA_TOKEN}` } }
   );
@@ -344,30 +252,31 @@ function overlaps(aStart, aEnd, bStart, bEnd) {
 function buildCandidateSlots({ service, fromISO, toISO, durationMin }) {
   const from = new Date(fromISO);
   const to = new Date(toISO);
+
   const slots = [];
 
-  // Range in clinic YMD
-  const startYMD = ymdInClinicTZ(from);
-  const endYMD = ymdInClinicTZ(to);
-
-  // iterate day by day by YMD (clinic local)
-  for (let ymd = startYMD; ymd <= endYMD; ymd = addDaysYMD(ymd, 1)) {
-    const key = weekdayKeyFromYMD(ymd);
+  for (let day = new Date(from); day <= to; day = addMinutes(day, 24 * 60)) {
+    const key = weekdayKey(day);
     const wh = WORK_HOURS[key];
     if (!wh) continue;
 
-    const dayStart = makeDateInTZ(ymd, wh.start, CLINIC_TIMEZONE);
-    const dayEnd = makeDateInTZ(ymd, wh.end, CLINIC_TIMEZONE);
+    const { h: sh, m: sm } = parseHM(wh.start);
+    const { h: eh, m: em } = parseHM(wh.end);
 
-    // window within [from,to]
+    const dayStart = new Date(day);
+    dayStart.setHours(sh, sm, 0, 0);
+
+    const dayEnd = new Date(day);
+    dayEnd.setHours(eh, em, 0, 0);
+
     let cursor = new Date(Math.max(dayStart.getTime(), from.getTime()));
-    cursor = ceilToStep(cursor, SLOT_STEP_MIN);
+    cursor.setSeconds(0, 0);
 
     while (addMinutes(cursor, durationMin) <= dayEnd && cursor <= to) {
       const end = addMinutes(cursor, durationMin);
       slots.push({
         slot_id: "slot_" + cursor.getTime(),
-        service: service || "evaluacion",
+        service: service || "Otro",
         start: cursor.toISOString(),
         end: end.toISOString(),
       });
@@ -375,44 +284,16 @@ function buildCandidateSlots({ service, fromISO, toISO, durationMin }) {
     }
   }
 
-  // sort
-  slots.sort((a, b) => new Date(a.start) - new Date(b.start));
   return slots;
 }
 
 async function getAvailableSlotsTool({ service, from, to }) {
   const calendar = getCalendarClient();
 
-  const durationMin = SERVICE_DURATION?.[service] || SERVICE_DURATION?.["otro"] || 30;
+  const durationMin = SERVICE_DURATION[service] || SERVICE_DURATION["Otro"] || 30;
 
-  // Normalize input ISO
-  let normFrom = normalizeISO(from, "from");
-  let normTo = normalizeISO(to, "to");
-
-  // ✅ Blindaje: si viene en pasado (ej. 2024), lo movemos a hoy -> +7 días (en RD)
-  const todayYMD = ymdInClinicTZ(new Date());
-  const todayStart = new Date(toISOInClinicTZFromYMD(todayYMD, "00:00"));
-
-  if (!normFrom) normFrom = toISOInClinicTZFromYMD(todayYMD, "00:00");
-  if (!normTo) normTo = toISOInClinicTZFromYMD(addDaysYMD(todayYMD, 7), "23:59");
-
-  const fromDate = new Date(normFrom);
-  const toDate = new Date(normTo);
-
-  if (toDate < todayStart) {
-    normFrom = toISOInClinicTZFromYMD(todayYMD, "00:00");
-    normTo = toISOInClinicTZFromYMD(addDaysYMD(todayYMD, 7), "23:59");
-  } else {
-    if (fromDate < todayStart) {
-      normFrom = toISOInClinicTZFromYMD(todayYMD, "00:00");
-    }
-    if (new Date(normTo) < new Date(normFrom)) {
-      normTo = toISOInClinicTZFromYMD(addDaysYMD(todayYMD, 7), "23:59");
-    }
-  }
-
-  const busyRanges = await getBusyRanges(calendar, normFrom, normTo);
-  const candidates = buildCandidateSlots({ service, fromISO: normFrom, toISO: normTo, durationMin });
+  const busyRanges = await getBusyRanges(calendar, from, to);
+  const candidates = buildCandidateSlots({ service, fromISO: from, toISO: to, durationMin });
 
   const free = candidates.filter((c) => {
     const cs = new Date(c.start);
@@ -458,7 +339,6 @@ async function bookAppointmentTool({ patient_name, phone, slot_id, service, note
     end: slot_end,
     service,
     patient_name,
-    phone,
   };
 }
 
@@ -520,186 +400,49 @@ async function handoffToHumanTool({ summary }) {
 async function callOpenAI({ userId, userText, userPhone }) {
   const session = getSession(userId);
 
-  // ✅ Mini pre-procesamiento de typo común
-  let cleaned = String(userText || "").trim();
-  cleaned = cleaned.replace(/agrandar/gi, "agendar");
+  const cleaned = String(userText || "").trim();
 
-  // ✅ Estado post-cita: no reiniciar flujo
-  if (session.state === "post_appointment" && session.activeAppointment) {
-    if (looksLikeThanks(cleaned)) {
-      return `¡Perfecto! ✅\nTe esperamos el ${formatInClinicTZ(session.activeAppointment.start)} a las ${formatTimeInClinicTZ(
-        session.activeAppointment.start
-      )}.\n\nSi necesitas *reprogramar* o *cancelar*, escríbelo aquí.`;
-    }
-
-    if (wantsNewAppointment(cleaned)) {
-      // reinicia para cita nueva
-      session.state = "idle";
-      session.lastSlots = null;
-      session.pendingSlot = null;
-      session.pendingService = null;
-      session.patientName = null;
-      session.patientPhone = null;
-      // seguimos al flow normal (OpenAI)
-    } else if (wantsCancel(cleaned)) {
-      // cancelar directo con memoria
-      const out = await cancelAppointmentTool({
-        appointment_id: session.activeAppointment.appointment_id,
-        reason: "Cancelación solicitada por el paciente (WhatsApp).",
-      });
-      session.state = "idle";
-      const when = `${formatInClinicTZ(session.activeAppointment.start)} ${formatTimeInClinicTZ(session.activeAppointment.start)}`;
-      session.activeAppointment = null;
-      return out.ok ? `✅ Listo. Tu cita (${when}) fue *cancelada*.\n\n¿Deseas agendar una cita nueva?` : `No pude cancelar ahora mismo. ¿Puedes intentar de nuevo?`;
-    } else if (wantsReschedule(cleaned)) {
-      // pedir slots para reprogramar (próximos 7 días)
-      session.state = "awaiting_reschedule_slot";
-      session.pendingService = session.activeAppointment.service;
-
-      const todayYMD = ymdInClinicTZ(new Date());
-      const from = toISOInClinicTZFromYMD(todayYMD, "00:00");
-      const to = toISOInClinicTZFromYMD(addDaysYMD(todayYMD, 7), "23:59");
-
-      const slots = await getAvailableSlotsTool({ service: session.pendingService, from, to });
-      session.lastSlots = slots;
-
-      if (!slots.length) {
-        return `Ahora mismo no veo espacios disponibles en los próximos días para *${session.pendingService}*.\n¿Quieres que lo revise para otra semana?`;
-      }
-
-      const lines = slots.map((s, i) => formatSlotLine(s, i)).join("\n");
-      return `Perfecto ✅\nEstos son los horarios disponibles para *${session.pendingService}* (hora Santo Domingo):\n\n${lines}\n\nResponde con el *número* (1-${slots.length}) o con la *hora* (ej: 10:00).`;
-    }
+  // ✅ NUEVO: si pide agendar pero no dijo servicio => mandamos lista bonita
+  const maybeService = normalizeService(cleaned);
+  const wantsAppointment = /(agendar|cita|reservar|turno|appointment)/i.test(cleaned);
+  if (wantsAppointment && !maybeService) {
+    // guardamos el mensaje del usuario en sesión (para contexto) y devolvemos acción
+    session.messages.push({ role: "user", content: cleaned });
+    return "__SEND_SERVICE_LIST__";
   }
 
-  // ✅ Selección de slot (nuevo agendamiento)
-  if (session.state === "awaiting_slot" && Array.isArray(session.lastSlots) && session.lastSlots.length) {
-    const chosen = extractSlotChoice(cleaned, session.lastSlots);
-    if (chosen) {
-      session.pendingSlot = chosen;
-      session.pendingService = chosen.service;
-      session.state = "awaiting_name";
-      return `Perfecto ✅ Queda seleccionado el horario *${formatTimeInClinicTZ(chosen.start)}*.\nAhora indícame tu *nombre completo* para reservar.`;
-    }
-    return `Dime el *número* del horario (1-${session.lastSlots.length}) o la *hora* (ej: 10:00).`;
-  }
-
-  // ✅ Selección de slot (reprogramación)
-  if (session.state === "awaiting_reschedule_slot" && session.activeAppointment && session.lastSlots?.length) {
-    const chosen = extractSlotChoice(cleaned, session.lastSlots);
-    if (chosen) {
-      const out = await rescheduleAppointmentTool({
-        appointment_id: session.activeAppointment.appointment_id,
-        new_slot_id: chosen.slot_id,
-        new_start: chosen.start,
-        new_end: chosen.end,
-      });
-
-      if (out.ok) {
-        // actualizar memoria de cita
-        session.activeAppointment.start = chosen.start;
-        session.activeAppointment.end = chosen.end;
-        session.state = "post_appointment";
-        return (
-          `✅ Listo. Tu cita fue *reprogramada*.\n\n` +
-          `📅 Nueva fecha: *${formatInClinicTZ(chosen.start)}*\n` +
-          `⏰ Nueva hora: *${formatTimeInClinicTZ(chosen.start)}*\n\n` +
-          `Si deseas *cancelar* o hacer una *cita nueva*, dímelo.`
-        );
-      }
-
-      return `No pude reprogramar ahora mismo. ¿Puedes intentar de nuevo?`;
-    }
-    return `Responde con el *número* (1-${session.lastSlots.length}) o con la *hora* (ej: 10:00).`;
-  }
-
-  // ✅ Captura nombre
-  if (session.state === "awaiting_name") {
-    // Evitar que el nombre sea solo números
-    if (/^\d+$/.test(cleaned)) {
-      return `Necesito tu *nombre completo* (ej: Franny Inoa).`;
-    }
-    session.patientName = cleaned;
-    session.state = "awaiting_phone";
-    return `Gracias, *${session.patientName}*.\nAhora envíame tu *número de teléfono* (ej: 829XXXXXXX) para completar la reserva.`;
-  }
-
-  // ✅ Captura teléfono + BOOK REAL (con start/end exactos)
-  if (session.state === "awaiting_phone") {
-    const phone = extractPhone(cleaned);
-    if (!phone) {
-      return `¿Me confirmas tu *número de teléfono*? (solo números, ej: 8294926619)`;
-    }
-    session.patientPhone = phone;
-
-    if (!session.pendingSlot) {
-      // por seguridad
-      session.state = "idle";
-      return `Se me perdió el horario seleccionado 😅\n¿Quieres que te muestre los horarios disponibles otra vez?`;
-    }
-
-    const booked = await bookAppointmentTool({
-      patient_name: session.patientName || "Paciente",
-      phone: session.patientPhone,
-      slot_id: session.pendingSlot.slot_id,
-      service: session.pendingSlot.service || "evaluacion",
-      notes: "",
-      slot_start: session.pendingSlot.start,
-      slot_end: session.pendingSlot.end,
-    });
-
-    session.activeAppointment = booked;
-    session.state = "post_appointment";
-
-    // limpiar pendientes para no duplicar
-    session.lastSlots = null;
-    session.pendingSlot = null;
-
-    return prettyConfirmation(booked);
-  }
-
-  // ---- OpenAI normal flow (para preguntas, pedir servicio, pedir rango, etc.) ----
-  const now = new Date();
-  const TODAY_YMD = ymdInClinicTZ(now);
-  const NOW_HUMAN = new Intl.DateTimeFormat("es-DO", {
-    timeZone: CLINIC_TIMEZONE,
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-    hour12: true,
-  }).format(now);
-
-  const apptCtx = session.activeAppointment
-    ? `\nCita activa en memoria:\n- appointment_id: ${session.activeAppointment.appointment_id}\n- servicio: ${session.activeAppointment.service}\n- fecha: ${formatInClinicTZ(session.activeAppointment.start)}\n- hora: ${formatTimeInClinicTZ(session.activeAppointment.start)}\n`
-    : "";
+  // ✅ NUEVO: si viene de botón service:..., conviértelo a texto limpio
+  const normalizedFromButton = normalizeService(cleaned);
+  const finalUserText = normalizedFromButton && cleaned.toLowerCase().startsWith("service:")
+    ? normalizedFromButton
+    : cleaned;
 
   const system = {
     role: "system",
     content: `
 Eres un asistente de WhatsApp de ${CLINIC_NAME} para agendar citas.
-
-Fecha y hora REALES ahora (Santo Domingo):
-- Hoy: ${TODAY_YMD}
-- Hora: ${NOW_HUMAN}
-Zona horaria: ${CLINIC_TIMEZONE}
-
 Reglas:
 - No diagnostiques ni des consejo médico. Solo agenda y triage.
 - Urgencias (dolor severo, sangrado fuerte, fiebre, trauma, hinchazón intensa): llama a handoff_to_human.
 - NO inventes horarios. Solo ofrece slots de get_available_slots.
-- Para reservar, debes pedir al usuario que elija un slot por número o por hora.
+- Para reservar, debes llamar a book_appointment con slot_start y slot_end EXACTOS del slot elegido.
 - Mantén respuestas cortas, claras y con opciones.
 
-Servicios válidos: limpieza, caries, ortodoncia, blanqueamiento, evaluacion, otro.
+Servicios válidos: ${SERVICES.join(", ")}.
+Interpretación por texto:
+- “limpieza / profilaxis / sarro” => “Limpiezas y prevención”
+- “brackets / alineadores” => “Ortodoncia”
+- “implante(s)” => “Implantes”
+- “niños / infantil” => “Odontopediatría”
+- “urgencia / dolor fuerte / sangrado / golpe / hinchazón” => “Urgencias”
+- “carillas / blanqueamiento / estética” => “Estética dental”
+
+Zona horaria: ${CLINIC_TIMEZONE}.
 Tel usuario: ${userPhone}.
-${apptCtx}
 `,
   };
 
-  // Guardar historial para la IA
-  session.messages.push({ role: "user", content: cleaned });
+  session.messages.push({ role: "user", content: finalUserText });
   const messages = [system, ...session.messages].slice(-14);
 
   const tools = [
@@ -801,7 +544,6 @@ ${apptCtx}
 
   const msg = resp.data.choices?.[0]?.message;
 
-  // Tool calls
   if (msg?.tool_calls?.length) {
     const toolResults = [];
     let lastSlots = null;
@@ -813,12 +555,6 @@ ${apptCtx}
       if (name === "get_available_slots") {
         const slots = await getAvailableSlotsTool(args);
         lastSlots = slots;
-
-        // ✅ Guardar slots en memoria para que el usuario responda con número/hora
-        session.lastSlots = slots;
-        session.state = "awaiting_slot";
-        session.pendingService = args.service || "evaluacion";
-
         toolResults.push({
           tool_call_id: tc.id,
           role: "tool",
@@ -829,9 +565,6 @@ ${apptCtx}
 
       if (name === "book_appointment") {
         const booked = await bookAppointmentTool(args);
-        session.activeAppointment = booked;
-        session.state = "post_appointment";
-
         toolResults.push({
           tool_call_id: tc.id,
           role: "tool",
@@ -883,23 +616,16 @@ ${apptCtx}
 
     let finalText = resp2.data.choices?.[0]?.message?.content?.trim() || "";
 
-    // ✅ Si obtuvimos slots, los mostramos en formato fijo y pedimos elección
-    if (lastSlots?.length) {
-      const dateLabel = formatInClinicTZ(lastSlots[0].start);
+    if (lastSlots?.length && /slots/i.test(JSON.stringify(toolResults)) && finalText.length < 5) {
       const lines = lastSlots.map((s, i) => formatSlotLine(s, i)).join("\n");
-      finalText =
-        `Estos son los horarios disponibles para *${session.pendingService}* (${dateLabel}) (hora Santo Domingo):\n\n` +
-        `${lines}\n\n` +
-        `Responde con el *número* (1-${lastSlots.length}) o con la *hora* (ej: 10:00).`;
+      finalText = `Estos son los horarios disponibles:\n${lines}\n\nRespóndeme con el número (1,2,3...) y tu nombre completo.`;
     }
 
     session.messages.push({ role: "assistant", content: finalText });
-    return finalText || "¿Para qué servicio deseas la cita? (limpieza, caries, ortodoncia, blanqueamiento, evaluación)";
+    return finalText || "¿Para qué servicio deseas la cita?";
   }
 
-  const text =
-    msg?.content?.trim() ||
-    "Hola 👋 ¿Qué servicio deseas agendar? (limpieza, caries, ortodoncia, blanqueamiento, evaluación)";
+  const text = msg?.content?.trim() || "Hola 👋 ¿Qué servicio deseas agendar?";
   session.messages.push({ role: "assistant", content: text });
   return text;
 }
@@ -926,15 +652,34 @@ app.post("/webhook", async (req, res) => {
     const msg = value?.messages?.[0];
     if (!msg) return res.sendStatus(200);
 
-    // ✅ Ignorar eventos que no son mensajes de texto reales (tests, estados, etc.)
-    if (!msg.from || !msg.text?.body) return res.sendStatus(200);
+    // ✅ CAMBIO: aceptar texto o interactive (lista/botón), ignorar estados/tests/etc.
+    if (!msg.from) return res.sendStatus(200);
+    const hasText = !!msg.text?.body;
+    const hasInteractive = !!msg.interactive;
+    if (!hasText && !hasInteractive) return res.sendStatus(200);
 
     const from = msg.from;
-    const text = msg.text.body;
+
+    // Texto normal
+    let text = msg.text?.body?.trim() || "";
+
+    // Selección lista (service list)
+    const listReplyId = msg.interactive?.list_reply?.id;
+    if (listReplyId) text = listReplyId;
+
+    // (Opcional) reply buttons
+    const buttonReplyId = msg.interactive?.button_reply?.id;
+    if (buttonReplyId) text = buttonReplyId;
 
     const reply = await callOpenAI({ userId: from, userText: text, userPhone: from });
-    await sendWhatsAppText(from, reply);
 
+    // ✅ Si toca mostrar lista bonita de servicios
+    if (reply === "__SEND_SERVICE_LIST__") {
+      await sendWhatsAppServiceList(from);
+      return res.sendStatus(200);
+    }
+
+    await sendWhatsAppText(from, reply);
     res.sendStatus(200);
   } catch (e) {
     console.error("Webhook error:", e?.message || e);
@@ -952,7 +697,6 @@ async function reminderLoop() {
     const calendar = getCalendarClient();
     const now = new Date();
     const in26h = addMinutes(now, 26 * 60);
-    const in3h = addMinutes(now, 3 * 60);
 
     const list = await calendar.events.list({
       calendarId: GOOGLE_CALENDAR_ID,
@@ -976,7 +720,6 @@ async function reminderLoop() {
       const start = new Date(startISO);
       const minutesToStart = Math.round((start.getTime() - now.getTime()) / 60000);
 
-      // 24h reminder
       if (
         REMINDER_24H &&
         minutesToStart <= 24 * 60 &&
@@ -985,11 +728,10 @@ async function reminderLoop() {
       ) {
         await sendWhatsAppText(
           phone,
-          `Recordatorio 🦷: tienes cita *mañana* en ${CLINIC_NAME}.\n📅 ${formatInClinicTZ(startISO)}\n⏰ ${formatTimeInClinicTZ(
-            startISO
-          )}\n\nResponde:\n1) Confirmar\n2) Reprogramar\n3) Cancelar`
+          `Recordatorio 🦷: tienes cita mañana a las ${String(start.getHours()).padStart(2, "0")}:${String(
+            start.getMinutes()
+          ).padStart(2, "0")} en ${CLINIC_NAME}.\n\nResponde:\n1) Confirmar\n2) Reprogramar\n3) Cancelar`
         );
-
         await calendar.events.patch({
           calendarId: GOOGLE_CALENDAR_ID,
           eventId: ev.id,
@@ -999,15 +741,18 @@ async function reminderLoop() {
         });
       }
 
-      // 2h reminder
-      if (REMINDER_2H && minutesToStart <= 120 && minutesToStart >= 105 && priv.reminder2hSent !== "true") {
+      if (
+        REMINDER_2H &&
+        minutesToStart <= 120 &&
+        minutesToStart >= 105 &&
+        priv.reminder2hSent !== "true"
+      ) {
         await sendWhatsAppText(
           phone,
-          `Recordatorio 🦷: tu cita es *hoy* en ${CLINIC_NAME}.\n📅 ${formatInClinicTZ(startISO)}\n⏰ ${formatTimeInClinicTZ(
-            startISO
-          )}\n${CLINIC_ADDRESS ? `📍 ${CLINIC_ADDRESS}\n` : ""}\nResponde:\n1) Confirmar\n2) Reprogramar\n3) Cancelar`
+          `Recordatorio 🦷: tu cita es hoy a las ${String(start.getHours()).padStart(2, "0")}:${String(
+            start.getMinutes()
+          ).padStart(2, "0")} en ${CLINIC_NAME}.\nDirección: ${CLINIC_ADDRESS}\n\nResponde:\n1) Confirmar\n2) Reprogramar\n3) Cancelar`
         );
-
         await calendar.events.patch({
           calendarId: GOOGLE_CALENDAR_ID,
           eventId: ev.id,
@@ -1022,7 +767,6 @@ async function reminderLoop() {
   }
 }
 
-// cada 5 minutos
 setInterval(reminderLoop, 5 * 60 * 1000);
 
 // =========================
