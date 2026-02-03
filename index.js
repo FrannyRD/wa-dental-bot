@@ -56,6 +56,9 @@ function getSession(userId) {
       pendingName: null,
       lastBooking: null, // {appointment_id,start,end,service,patient_name,phone}
       greeted: false, // NEW: to show services menu once per session
+
+      // ✅ NEW: dedupe webhook retries
+      lastMsgId: null,
     });
   }
   return sessions.get(userId);
@@ -180,6 +183,15 @@ function isGreeting(textNorm) {
     t.includes("cancel");
 
   return isOnlyGreeting && !hasBookingIntent && t.length <= 40;
+}
+
+// ✅ NEW: mensaje corto para 2do saludo (sin menú)
+function quickHelpText() {
+  return (
+    `¡Hola! 😊\n` +
+    `¿Qué servicio deseas agendar?\n\n` +
+    `Puedes escribir el servicio (ej: "Ortodoncia") o escribir "servicios" para ver el menú.`
+  );
 }
 
 // ---- Timezone utilities ----
@@ -888,7 +900,7 @@ Tel usuario: ${userPhone}.
           tool_call_id: tc.id,
           role: "tool",
           name,
-         content: JSON.stringify({ booked }),
+          content: JSON.stringify({ booked }),
         });
       }
 
@@ -1010,6 +1022,11 @@ app.post("/webhook", async (req, res) => {
 
     const session = getSession(from);
 
+    // ✅ NEW: dedupe por reintentos de Meta (evita mensajes duplicados)
+    const msgId = msg?.id;
+    if (msgId && session.lastMsgId === msgId) return res.sendStatus(200);
+    if (msgId) session.lastMsgId = msgId;
+
     const userTextRaw = extractIncomingText(msg);
     const userText = (userTextRaw || "").trim();
     const tNorm = normalizeText(userText);
@@ -1019,7 +1036,7 @@ app.post("/webhook", async (req, res) => {
     // =========================
     // FIX: evitar respuestas múltiples al saludar
     // - Solo saluda (A/B + menú) si es un saludo simple y NO trae intención de cita
-    // - Y luego return inmediato para no seguir el flujo
+    // - En el 2do "hola", responde corto (sin menú)
     // =========================
     const detectedServiceEarly = detectServiceKeyFromUser(userText);
     const detectedRangeEarly = parseDateRangeFromText(userText);
@@ -1032,6 +1049,13 @@ app.post("/webhook", async (req, res) => {
       tNorm.includes("reprogram") ||
       tNorm.includes("cancel");
 
+    // ✅ NEW: si ya saludamos antes y vuelve a decir "hola", NO mandar menú otra vez
+    if (session.greeted && session.state === "idle" && isGreeting(tNorm) && !hasEarlyIntent) {
+      await sendWhatsAppText(from, quickHelpText());
+      return res.sendStatus(200);
+    }
+
+    // 1er saludo: A/B + menú
     if (!session.greeted && session.state === "idle" && isGreeting(tNorm) && !hasEarlyIntent) {
       session.greeted = true;
       await sendWhatsAppText(from, servicesEmojiText());
@@ -1039,7 +1063,7 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // (Opcional: si quieres marcar greeted en el primer mensaje “no saludo” para no repetir luego)
+    // (Opcional: marcar greeted en el primer mensaje “no saludo” para no repetir luego)
     if (!session.greeted && session.state === "idle") {
       session.greeted = true;
     }
@@ -1111,7 +1135,10 @@ app.post("/webhook", async (req, res) => {
     if (session.state === "await_slot_choice" && session.lastSlots?.length) {
       const picked = tryPickSlotFromUserText(session, userText);
       if (!picked) {
-        await sendWhatsAppText(from, `No entendí el horario 🙏\nResponde con el *número* (1,2,3...) o la *hora* (ej: 10:00).`);
+        await sendWhatsAppText(
+          from,
+          `No entendí el horario 🙏\nResponde con el *número* (1,2,3...) o la *hora* (ej: 10:00).`
+        );
         return res.sendStatus(200);
       }
       session.selectedSlot = picked;
