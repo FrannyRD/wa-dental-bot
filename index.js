@@ -31,9 +31,13 @@ const REMINDER_2H = (process.env.REMINDER_2H || "1") === "1";
 // Express (raw body for signature check)
 // =========================
 const app = express();
-app.use(express.json({
-  verify: (req, res, buf) => { req.rawBody = buf; }
-}));
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 
 // =========================
 // Simple memory (MVP)
@@ -41,7 +45,15 @@ app.use(express.json({
 // =========================
 const sessions = new Map();
 function getSession(userId) {
-  if (!sessions.has(userId)) sessions.set(userId, { messages: [] });
+  // ✅ CAMBIO: añadimos memoria de slots + selección + datos parciales
+  if (!sessions.has(userId))
+    sessions.set(userId, {
+      messages: [],
+      lastSlots: [],
+      pickedSlot: null,
+      patientName: null,
+      patientPhone: null,
+    });
   return sessions.get(userId);
 }
 
@@ -49,7 +61,11 @@ function getSession(userId) {
 // Helpers
 // =========================
 function safeJson(str, fallback) {
-  try { return JSON.parse(str); } catch { return fallback; }
+  try {
+    return JSON.parse(str);
+  } catch {
+    return fallback;
+  }
 }
 
 function defaultWorkHours() {
@@ -60,22 +76,31 @@ function defaultWorkHours() {
     thu: { start: "09:00", end: "18:00" },
     fri: { start: "09:00", end: "18:00" },
     sat: { start: "09:00", end: "13:00" },
-    sun: null
+    sun: null,
   };
 }
 
 function defaultServiceDuration() {
-  return { limpieza: 45, caries: 45, ortodoncia: 30, blanqueamiento: 60, evaluacion: 30, otro: 30 };
+  return {
+    limpieza: 45,
+    caries: 45,
+    ortodoncia: 30,
+    blanqueamiento: 60,
+    evaluacion: 30,
+    otro: 30,
+  };
 }
 
 function verifyMetaSignature(req) {
   if (!META_APP_SECRET) return true;
   const signature = req.get("X-Hub-Signature-256");
   if (!signature) return false;
-  const expected = "sha256=" + crypto
-    .createHmac("sha256", META_APP_SECRET)
-    .update(req.rawBody || Buffer.from(""))
-    .digest("hex");
+  const expected =
+    "sha256=" +
+    crypto
+      .createHmac("sha256", META_APP_SECRET)
+      .update(req.rawBody || Buffer.from(""))
+      .digest("hex");
   try {
     return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
   } catch {
@@ -92,14 +117,14 @@ function toISO(date) {
 }
 
 function parseHM(hm) {
-  const [h, m] = hm.split(":").map(n => parseInt(n, 10));
+  const [h, m] = hm.split(":").map((n) => parseInt(n, 10));
   return { h, m };
 }
 
 function weekdayKey(date) {
   // JS: 0=Sun..6=Sat
   const d = date.getDay();
-  return ["sun","mon","tue","wed","thu","fri","sat"][d];
+  return ["sun", "mon", "tue", "wed", "thu", "fri", "sat"][d];
 }
 
 function formatSlotLine(slot, i) {
@@ -107,7 +132,44 @@ function formatSlotLine(slot, i) {
   const dt = new Date(slot.start);
   const hh = String(dt.getHours()).padStart(2, "0");
   const mm = String(dt.getMinutes()).padStart(2, "0");
-  return `${i+1}) ${hh}:${mm} (${slot.service})`;
+  return `${i + 1}) ${hh}:${mm} (${slot.service})`;
+}
+
+// ✅ CAMBIO: detecta si un texto parece teléfono
+function looksLikePhone(s) {
+  const digits = (s || "").replace(/\D/g, "");
+  return digits.length >= 10 && digits.length <= 15;
+}
+
+// ✅ CAMBIO: encontrar slot por número (1..8) o por hora (9, 9:00, 09:15)
+function pickSlotFromUserText(userText, slots) {
+  const t = (userText || "").trim().toLowerCase();
+  if (!slots?.length) return null;
+
+  // por índice: "1", "2", ...
+  const asInt = parseInt(t, 10);
+  if (!Number.isNaN(asInt) && asInt >= 1 && asInt <= slots.length) {
+    return slots[asInt - 1];
+  }
+
+  // por hora: "9", "9:00", "09:15"
+  const m = t.match(/(\d{1,2})(?::(\d{2}))?/);
+  if (m) {
+    const hh = m[1].padStart(2, "0");
+    const mm = (m[2] ?? "00").padStart(2, "0");
+    const target = `${hh}:${mm}`;
+
+    const found = slots.find((s) => {
+      const d = new Date(s.start);
+      const sh = String(d.getHours()).padStart(2, "0");
+      const sm = String(d.getMinutes()).padStart(2, "0");
+      return `${sh}:${sm}` === target;
+    });
+
+    return found || null;
+  }
+
+  return null;
 }
 
 // =========================
@@ -121,7 +183,7 @@ async function sendWhatsAppText(to, text) {
       messaging_product: "whatsapp",
       to,
       type: "text",
-      text: { body: text }
+      text: { body: text },
     },
     { headers: { Authorization: `Bearer ${WA_TOKEN}` } }
   );
@@ -139,7 +201,7 @@ function getCalendarClient() {
   const auth = new google.auth.JWT({
     email: json.client_email,
     key: json.private_key,
-    scopes: ["https://www.googleapis.com/auth/calendar"]
+    scopes: ["https://www.googleapis.com/auth/calendar"],
   });
 
   return google.calendar({ version: "v3", auth });
@@ -154,15 +216,15 @@ async function getBusyRanges(calendar, timeMinISO, timeMaxISO) {
       timeMin: timeMinISO,
       timeMax: timeMaxISO,
       timeZone: CLINIC_TIMEZONE,
-      items: [{ id: GOOGLE_CALENDAR_ID }]
-    }
+      items: [{ id: GOOGLE_CALENDAR_ID }],
+    },
   });
 
   const busy = fb.data.calendars?.[GOOGLE_CALENDAR_ID]?.busy || [];
   // busy ranges: [{start,end}]
-  return busy.map(b => ({
+  return busy.map((b) => ({
     start: new Date(b.start),
-    end: new Date(b.end)
+    end: new Date(b.end),
   }));
 }
 
@@ -193,7 +255,6 @@ function buildCandidateSlots({ service, fromISO, toISO, durationMin }) {
 
     // window must be within range [from,to]
     let cursor = new Date(Math.max(dayStart.getTime(), from.getTime()));
-    // align cursor to step (roughly)
     cursor.setSeconds(0, 0);
 
     while (addMinutes(cursor, durationMin) <= dayEnd && cursor <= to) {
@@ -202,7 +263,7 @@ function buildCandidateSlots({ service, fromISO, toISO, durationMin }) {
         slot_id: "slot_" + cursor.getTime(), // deterministic id
         service: service || "evaluacion",
         start: cursor.toISOString(),
-        end: end.toISOString()
+        end: end.toISOString(),
       });
       cursor = addMinutes(cursor, SLOT_STEP_MIN);
     }
@@ -219,10 +280,10 @@ async function getAvailableSlotsTool({ service, from, to }) {
   const busyRanges = await getBusyRanges(calendar, from, to);
   const candidates = buildCandidateSlots({ service, fromISO: from, toISO: to, durationMin });
 
-  const free = candidates.filter(c => {
+  const free = candidates.filter((c) => {
     const cs = new Date(c.start);
     const ce = new Date(c.end);
-    return !busyRanges.some(b => overlaps(cs, ce, b.start, b.end));
+    return !busyRanges.some((b) => overlaps(cs, ce, b.start, b.end));
   });
 
   // limita para WhatsApp (no spamear)
@@ -235,7 +296,6 @@ async function getAvailableSlotsTool({ service, from, to }) {
 async function bookAppointmentTool({ patient_name, phone, slot_id, service, notes, slot_start, slot_end }) {
   const calendar = getCalendarClient();
 
-  // slot_start/slot_end vienen del modelo (desde la lista de slots mostrada)
   if (!slot_start || !slot_end) throw new Error("Missing slot_start/slot_end");
 
   const event = await calendar.events.insert({
@@ -253,10 +313,10 @@ async function bookAppointmentTool({ patient_name, phone, slot_id, service, note
           service,
           slot_id,
           reminder24hSent: "false",
-          reminder2hSent: "false"
-        }
-      }
-    }
+          reminder2hSent: "false",
+        },
+      },
+    },
   });
 
   return {
@@ -264,7 +324,7 @@ async function bookAppointmentTool({ patient_name, phone, slot_id, service, note
     start: slot_start,
     end: slot_end,
     service,
-    patient_name
+    patient_name,
   };
 }
 
@@ -283,10 +343,10 @@ async function rescheduleAppointmentTool({ appointment_id, new_slot_id, new_star
         private: {
           slot_id: new_slot_id,
           reminder24hSent: "false",
-          reminder2hSent: "false"
-        }
-      }
-    }
+          reminder2hSent: "false",
+        },
+      },
+    },
   });
 
   return { ok: true, appointment_id: updated.data.id, new_start, new_end };
@@ -295,7 +355,6 @@ async function rescheduleAppointmentTool({ appointment_id, new_slot_id, new_star
 async function cancelAppointmentTool({ appointment_id, reason }) {
   const calendar = getCalendarClient();
 
-  // En vez de borrar, lo marcamos cancelado (mejor para historial)
   const event = await calendar.events.get({ calendarId: GOOGLE_CALENDAR_ID, eventId: appointment_id });
 
   const summary = event.data.summary || "Cita";
@@ -308,10 +367,10 @@ async function cancelAppointmentTool({ appointment_id, reason }) {
       extendedProperties: {
         private: {
           ...(event.data.extendedProperties?.private || {}),
-          status: "cancelled"
-        }
-      }
-    }
+          status: "cancelled",
+        },
+      },
+    },
   });
 
   return { ok: true, appointment_id };
@@ -328,6 +387,25 @@ async function handoffToHumanTool({ summary }) {
 async function callOpenAI({ userId, userText, userPhone }) {
   const session = getSession(userId);
 
+  // ✅ CAMBIO: si el usuario elige un slot por número u hora, lo guardamos y pedimos nombre (sin recalcular)
+  const picked = pickSlotFromUserText(userText, session.lastSlots);
+  if (picked) {
+    session.pickedSlot = picked;
+    session.patientName = null;
+    session.patientPhone = null;
+
+    const dt = new Date(picked.start);
+    const hh = String(dt.getHours()).padStart(2, "0");
+    const mm = String(dt.getMinutes()).padStart(2, "0");
+
+    const msgText = `Perfecto ✅ Queda seleccionado el horario ${hh}:${mm}.\nAhora indícame tu *nombre completo* para reservar.`;
+    session.messages.push({ role: "assistant", content: msgText });
+    return msgText;
+  }
+
+  // ✅ CAMBIO: pasamos "Fecha/hora actual" para que “mañana” sea mañana real
+  const nowStr = new Date().toLocaleString("es-DO", { timeZone: CLINIC_TIMEZONE });
+
   const system = {
     role: "system",
     content: `
@@ -341,8 +419,9 @@ Reglas:
 
 Servicios válidos: limpieza, caries, ortodoncia, blanqueamiento, evaluacion, otro.
 Zona horaria: ${CLINIC_TIMEZONE}.
+Fecha/hora actual: ${nowStr}.
 Tel usuario: ${userPhone}.
-`
+`,
   };
 
   session.messages.push({ role: "user", content: userText });
@@ -359,11 +438,11 @@ Tel usuario: ${userPhone}.
           properties: {
             service: { type: "string" },
             from: { type: "string" },
-            to: { type: "string" }
+            to: { type: "string" },
           },
-          required: ["from", "to"]
-        }
-      }
+          required: ["from", "to"],
+        },
+      },
     },
     {
       type: "function",
@@ -379,11 +458,11 @@ Tel usuario: ${userPhone}.
             service: { type: "string" },
             notes: { type: "string" },
             slot_start: { type: "string" },
-            slot_end: { type: "string" }
+            slot_end: { type: "string" },
           },
-          required: ["patient_name", "phone", "slot_id", "service", "slot_start", "slot_end"]
-        }
-      }
+          required: ["patient_name", "phone", "slot_id", "service", "slot_start", "slot_end"],
+        },
+      },
     },
     {
       type: "function",
@@ -396,11 +475,11 @@ Tel usuario: ${userPhone}.
             appointment_id: { type: "string" },
             new_slot_id: { type: "string" },
             new_start: { type: "string" },
-            new_end: { type: "string" }
+            new_end: { type: "string" },
           },
-          required: ["appointment_id", "new_slot_id", "new_start", "new_end"]
-        }
-      }
+          required: ["appointment_id", "new_slot_id", "new_start", "new_end"],
+        },
+      },
     },
     {
       type: "function",
@@ -411,11 +490,11 @@ Tel usuario: ${userPhone}.
           type: "object",
           properties: {
             appointment_id: { type: "string" },
-            reason: { type: "string" }
+            reason: { type: "string" },
           },
-          required: ["appointment_id"]
-        }
-      }
+          required: ["appointment_id"],
+        },
+      },
     },
     {
       type: "function",
@@ -425,12 +504,12 @@ Tel usuario: ${userPhone}.
         parameters: {
           type: "object",
           properties: {
-            summary: { type: "string" }
+            summary: { type: "string" },
           },
-          required: ["summary"]
-        }
-      }
-    }
+          required: ["summary"],
+        },
+      },
+    },
   ];
 
   const resp = await axios.post(
@@ -440,7 +519,7 @@ Tel usuario: ${userPhone}.
       messages,
       tools,
       tool_choice: "auto",
-      temperature: 0.2
+      temperature: 0.2,
     },
     { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
   );
@@ -459,11 +538,15 @@ Tel usuario: ${userPhone}.
       if (name === "get_available_slots") {
         const slots = await getAvailableSlotsTool(args);
         lastSlots = slots;
+
+        // ✅ CAMBIO: guardar slots para que el usuario elija y NO se recalculen
+        session.lastSlots = slots;
+
         toolResults.push({
           tool_call_id: tc.id,
           role: "tool",
           name,
-          content: JSON.stringify({ slots })
+          content: JSON.stringify({ slots }),
         });
       }
 
@@ -473,7 +556,7 @@ Tel usuario: ${userPhone}.
           tool_call_id: tc.id,
           role: "tool",
           name,
-          content: JSON.stringify({ booked })
+          content: JSON.stringify({ booked }),
         });
       }
 
@@ -483,7 +566,7 @@ Tel usuario: ${userPhone}.
           tool_call_id: tc.id,
           role: "tool",
           name,
-          content: JSON.stringify(out)
+          content: JSON.stringify(out),
         });
       }
 
@@ -493,7 +576,7 @@ Tel usuario: ${userPhone}.
           tool_call_id: tc.id,
           role: "tool",
           name,
-          content: JSON.stringify(out)
+          content: JSON.stringify(out),
         });
       }
 
@@ -503,7 +586,7 @@ Tel usuario: ${userPhone}.
           tool_call_id: tc.id,
           role: "tool",
           name,
-          content: JSON.stringify(out)
+          content: JSON.stringify(out),
         });
       }
     }
@@ -513,7 +596,7 @@ Tel usuario: ${userPhone}.
       {
         model: "gpt-4.1-mini",
         messages: [...messages, msg, ...toolResults],
-        temperature: 0.2
+        temperature: 0.2,
       },
       { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
     );
@@ -521,17 +604,18 @@ Tel usuario: ${userPhone}.
     let finalText = resp2.data.choices?.[0]?.message?.content?.trim() || "";
 
     // Si devolvió slots y no los formateó “bonito”, lo ayudamos:
-    // (Esto no rompe “todo con ChatGPT”, solo mejora UX)
     if (lastSlots?.length && /slots/i.test(JSON.stringify(toolResults)) && finalText.length < 5) {
       const lines = lastSlots.map((s, i) => formatSlotLine(s, i)).join("\n");
-      finalText = `Estos son los horarios disponibles:\n${lines}\n\nRespóndeme con el número (1,2,3...) y tu nombre completo.`;
+      finalText = `Estos son los horarios disponibles:\n${lines}\n\nRespóndeme con el número (1,2,3...) o con la hora (ej: 9:15).`;
     }
 
     session.messages.push({ role: "assistant", content: finalText });
     return finalText || "¿Para qué servicio deseas la cita? (limpieza, caries, ortodoncia, blanqueamiento, evaluación)";
   }
 
-  const text = msg?.content?.trim() || "Hola 👋 ¿Qué servicio deseas agendar? (limpieza, caries, ortodoncia, blanqueamiento, evaluación)";
+  const text =
+    msg?.content?.trim() ||
+    "Hola 👋 ¿Qué servicio deseas agendar? (limpieza, caries, ortodoncia, blanqueamiento, evaluación)";
   session.messages.push({ role: "assistant", content: text });
   return text;
 }
@@ -558,12 +642,83 @@ app.post("/webhook", async (req, res) => {
     const msg = value?.messages?.[0];
     if (!msg) return res.sendStatus(200);
 
-    // ✅ CAMBIO: Ignorar eventos que no son mensajes de texto reales (tests, estados, etc.)
+    // ✅ CAMBIO (ya lo tenías): Ignorar eventos que no son mensajes de texto reales
     if (!msg.from || !msg.text?.body) return res.sendStatus(200);
 
     const from = msg.from;
     const text = msg.text.body;
 
+    const session = getSession(from);
+
+    // ✅ CAMBIO: si ya hay un slot seleccionado, completamos nombre/teléfono y reservamos ESE slot (sin recalcular)
+    if (session.pickedSlot) {
+      // Si llega teléfono primero
+      if (!session.patientPhone && looksLikePhone(text)) {
+        session.patientPhone = text.replace(/\D/g, "");
+        await sendWhatsAppText(from, "Gracias. Ahora indícame tu *nombre completo* para reservar.");
+        return res.sendStatus(200);
+      }
+
+      // Si llega nombre primero
+      if (!session.patientName && !looksLikePhone(text)) {
+        session.patientName = text.trim();
+        await sendWhatsAppText(from, "Gracias. Ahora envíame tu *número de teléfono* (ej: 829XXXXXXX) para completar la reserva.");
+        return res.sendStatus(200);
+      }
+
+      // Si ya tenemos ambos (en cualquier orden), reservamos
+      if (session.patientName && session.patientPhone) {
+        const s = session.pickedSlot;
+
+        const booked = await bookAppointmentTool({
+          patient_name: session.patientName,
+          phone: session.patientPhone,
+          slot_id: s.slot_id,
+          service: s.service || "evaluacion",
+          notes: "",
+          slot_start: s.start,
+          slot_end: s.end,
+        });
+
+        // limpiar estado para evitar doble reserva
+        session.pickedSlot = null;
+        session.lastSlots = [];
+        session.patientName = null;
+        session.patientPhone = null;
+
+        const dt = new Date(booked.start).toLocaleString("es-DO", { timeZone: CLINIC_TIMEZONE });
+
+        await sendWhatsAppText(
+          from,
+          `✅ He reservado tu cita:\n\nServicio: ${booked.service}\nFecha/Hora: ${dt}\nNombre: ${booked.patient_name}\nTeléfono: ${session?.patientPhone || ""}\n\n¿Deseas reprogramar o cancelar?`
+        );
+
+        return res.sendStatus(200);
+      }
+
+      // Si el usuario manda ambos en un solo mensaje (ej: "Franny 829...")
+      if (!session.patientName || !session.patientPhone) {
+        const digits = text.replace(/\D/g, "");
+        if (digits.length >= 10 && digits.length <= 15) {
+          session.patientPhone = digits;
+          // quita el teléfono del texto para dejar nombre
+          const nameGuess = text.replace(digits, "").trim();
+          if (nameGuess) session.patientName = nameGuess;
+        }
+        if (!session.patientName) {
+          await sendWhatsAppText(from, "Solo me falta tu *nombre completo* para reservar.");
+          return res.sendStatus(200);
+        }
+        if (!session.patientPhone) {
+          await sendWhatsAppText(from, "Solo me falta tu *número de teléfono* para reservar.");
+          return res.sendStatus(200);
+        }
+
+        // si ya quedaron ambos, la siguiente iteración lo reservará
+      }
+    }
+
+    // flujo normal (OpenAI + tools)
     const reply = await callOpenAI({ userId: from, userText: text, userPhone: from });
     await sendWhatsAppText(from, reply);
 
@@ -573,7 +728,6 @@ app.post("/webhook", async (req, res) => {
     res.sendStatus(200);
   }
 });
-
 
 app.get("/", (req, res) => res.send("OK"));
 
@@ -594,7 +748,7 @@ async function reminderLoop() {
       timeMax: in26h.toISOString(),
       singleEvents: true,
       orderBy: "startTime",
-      maxResults: 50
+      maxResults: 50,
     });
 
     const events = list.data.items || [];
@@ -611,17 +765,24 @@ async function reminderLoop() {
       const minutesToStart = Math.round((start.getTime() - now.getTime()) / 60000);
 
       // 24h reminder (envuelve 24h +/- 30 min)
-      if (REMINDER_24H && minutesToStart <= 24*60 && minutesToStart >= (24*60 - 30) && priv.reminder24hSent !== "true") {
+      if (
+        REMINDER_24H &&
+        minutesToStart <= 24 * 60 &&
+        minutesToStart >= 24 * 60 - 30 &&
+        priv.reminder24hSent !== "true"
+      ) {
         await sendWhatsAppText(
           phone,
-          `Recordatorio 🦷: tienes cita mañana a las ${String(start.getHours()).padStart(2,"0")}:${String(start.getMinutes()).padStart(2,"0")} en ${CLINIC_NAME}.\n\nResponde:\n1) Confirmar\n2) Reprogramar\n3) Cancelar`
+          `Recordatorio 🦷: tienes cita mañana a las ${String(start.getHours()).padStart(2, "0")}:${String(
+            start.getMinutes()
+          ).padStart(2, "0")} en ${CLINIC_NAME}.\n\nResponde:\n1) Confirmar\n2) Reprogramar\n3) Cancelar`
         );
         await calendar.events.patch({
           calendarId: GOOGLE_CALENDAR_ID,
           eventId: ev.id,
           requestBody: {
-            extendedProperties: { private: { ...priv, reminder24hSent: "true" } }
-          }
+            extendedProperties: { private: { ...priv, reminder24hSent: "true" } },
+          },
         });
       }
 
@@ -629,14 +790,16 @@ async function reminderLoop() {
       if (REMINDER_2H && minutesToStart <= 120 && minutesToStart >= 105 && priv.reminder2hSent !== "true") {
         await sendWhatsAppText(
           phone,
-          `Recordatorio 🦷: tu cita es hoy a las ${String(start.getHours()).padStart(2,"0")}:${String(start.getMinutes()).padStart(2,"0")} en ${CLINIC_NAME}.\nDirección: ${CLINIC_ADDRESS}\n\nResponde:\n1) Confirmar\n2) Reprogramar\n3) Cancelar`
+          `Recordatorio 🦷: tu cita es hoy a las ${String(start.getHours()).padStart(2, "0")}:${String(
+            start.getMinutes()
+          ).padStart(2, "0")} en ${CLINIC_NAME}.\nDirección: ${CLINIC_ADDRESS}\n\nResponde:\n1) Confirmar\n2) Reprogramar\n3) Cancelar`
         );
         await calendar.events.patch({
           calendarId: GOOGLE_CALENDAR_ID,
           eventId: ev.id,
           requestBody: {
-            extendedProperties: { private: { ...priv, reminder2hSent: "true" } }
-          }
+            extendedProperties: { private: { ...priv, reminder2hSent: "true" } },
+          },
         });
       }
     }
@@ -652,3 +815,4 @@ setInterval(reminderLoop, 5 * 60 * 1000);
 // Start
 // =========================
 app.listen(PORT, () => console.log(`Bot running on :${PORT}`));
+
