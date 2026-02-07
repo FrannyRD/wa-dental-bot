@@ -28,11 +28,141 @@ const REMINDER_24H = (process.env.REMINDER_24H || "1") === "1";
 const REMINDER_2H = (process.env.REMINDER_2H || "1") === "1";
 
 // =========================
-// ✅ BOTHUB (mínimos para conectar al Hub)
+// ✅ BOTHUB (para ver todo en el Hub)
 // =========================
 const BOTHUB_WEBHOOK_URL = process.env.BOTHUB_WEBHOOK_URL || ""; // URL completa: .../api/webhooks/webhook/:botId
 const BOTHUB_WEBHOOK_SECRET = process.env.BOTHUB_WEBHOOK_SECRET || "";
 const BOTHUB_TIMEOUT_MS = Number(process.env.BOTHUB_TIMEOUT_MS || 6000);
+
+// =====================================================
+// Stable stringify (para firma HMAC consistente)
+// =====================================================
+function stableStringify(obj) {
+  if (obj === null || typeof obj !== "object") return JSON.stringify(obj);
+  if (Array.isArray(obj)) return `[${obj.map(stableStringify).join(",")}]`;
+  const keys = Object.keys(obj).sort();
+  return `{${keys.map((k) => JSON.stringify(k) + ":" + stableStringify(obj[k])).join(",")}}`;
+}
+
+function bothubHmacStable(payload, secret) {
+  const raw = stableStringify(payload);
+  return crypto.createHmac("sha256", secret).update(raw).digest("hex");
+}
+
+function bothubHmacJson(payload, secret) {
+  return crypto.createHmac("sha256", secret).update(JSON.stringify(payload)).digest("hex");
+}
+
+function getHubSignature(req) {
+  const h =
+    req.get("X-HUB-SIGNATURE") ||
+    req.get("x-hub-signature") ||
+    req.get("X-Hub-Signature") ||
+    req.get("X-HUB-SIGNATURE-256") ||
+    req.get("X-Hub-Signature-256") ||
+    req.get("x-hub-signature-256") ||
+    "";
+
+  const sig = String(h || "").trim();
+  if (!sig) return "";
+  return sig.startsWith("sha256=") ? sig.slice("sha256=".length) : sig;
+}
+
+function timingSafeEqualHex(aHex, bHex) {
+  const a = Buffer.from(String(aHex || ""), "utf8");
+  const b = Buffer.from(String(bHex || ""), "utf8");
+  if (!a.length || a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+// ✅ Validador robusto: acepta firma con stableStringify o JSON.stringify
+function verifyHubSignature(reqBody, signatureHex, secret) {
+  if (!signatureHex || !secret) return false;
+
+  const expectedStable = bothubHmacStable(reqBody, secret);
+  if (timingSafeEqualHex(signatureHex, expectedStable)) return true;
+
+  const expectedJson = bothubHmacJson(reqBody, secret);
+  if (timingSafeEqualHex(signatureHex, expectedJson)) return true;
+
+  return false;
+}
+
+async function bothubReportMessage(payload) {
+  // NO rompe tu bot si no está configurado
+  if (!BOTHUB_WEBHOOK_URL || !BOTHUB_WEBHOOK_SECRET) return;
+
+  try {
+    const sig = bothubHmacStable(payload, BOTHUB_WEBHOOK_SECRET);
+    await axios.post(BOTHUB_WEBHOOK_URL, payload, {
+      headers: {
+        "Content-Type": "application/json",
+        "X-HUB-SIGNATURE": sig,
+      },
+      timeout: BOTHUB_TIMEOUT_MS,
+    });
+  } catch (e) {
+    console.error("Bothub report failed:", e?.response?.data || e?.message || e);
+  }
+}
+
+// ✅ Meta para audio/ubicación/attachments (para que en Hub se vea TODO)
+function extractInboundMeta(msg) {
+  if (!msg) return {};
+
+  if (msg?.type === "audio") {
+    return {
+      kind: "AUDIO",
+      mediaId: msg?.audio?.id,
+      mimeType: msg?.audio?.mime_type,
+      voice: msg?.audio?.voice,
+    };
+  }
+
+  if (msg?.type === "location") {
+    return {
+      kind: "LOCATION",
+      latitude: msg?.location?.latitude,
+      longitude: msg?.location?.longitude,
+      name: msg?.location?.name,
+      address: msg?.location?.address,
+    };
+  }
+
+  if (msg?.type === "image")
+    return {
+      kind: "IMAGE",
+      mediaId: msg?.image?.id,
+      mimeType: msg?.image?.mime_type,
+      caption: msg?.image?.caption,
+    };
+
+  if (msg?.type === "video")
+    return {
+      kind: "VIDEO",
+      mediaId: msg?.video?.id,
+      mimeType: msg?.video?.mime_type,
+      caption: msg?.video?.caption,
+    };
+
+  if (msg?.type === "document")
+    return {
+      kind: "DOCUMENT",
+      mediaId: msg?.document?.id,
+      mimeType: msg?.document?.mime_type,
+      filename: msg?.document?.filename,
+    };
+
+  if (msg?.type === "sticker")
+    return { kind: "STICKER", mediaId: msg?.sticker?.id, mimeType: msg?.sticker?.mime_type };
+
+  if (msg?.type === "contacts") return { kind: "CONTACTS", count: msg?.contacts?.length || 0 };
+
+  if (msg?.type === "reaction")
+    return { kind: "REACTION", emoji: msg?.reaction?.emoji, messageId: msg?.reaction?.message_id };
+
+  return { kind: msg?.type ? String(msg.type).toUpperCase() : "UNKNOWN" };
+}
 
 // =========================
 // Express (raw body for signature check)
@@ -62,9 +192,9 @@ function getSession(userId) {
       pendingRange: null,
       pendingName: null,
       lastBooking: null, // {appointment_id,start,end,service,patient_name,phone}
-      greeted: false, // to show services menu once per session
+      greeted: false, // NEW: to show services menu once per session
 
-      // ✅ dedupe webhook retries
+      // ✅ NEW: dedupe webhook retries
       lastMsgId: null,
     });
   }
@@ -72,7 +202,7 @@ function getSession(userId) {
 }
 
 // =========================
-// Services
+// Services (requested list)
 // =========================
 const SERVICES = [
   { key: "estetica_dental", title: "Estética dental", id: "svc_estetica" },
@@ -188,7 +318,7 @@ function isGreeting(textNorm) {
   return isOnlyGreeting && !hasBookingIntent && t.length <= 40;
 }
 
-// mensaje corto para 2do saludo (sin menú)
+// ✅ NEW: mensaje corto para 2do saludo (sin menú)
 function quickHelpText() {
   return (
     `¡Hola! 😊\n` +
@@ -280,123 +410,10 @@ function looksLikeNewAppointment(textNorm) {
 }
 
 // =========================
-// ✅ BOTHUB helpers (firma + report)
-// =========================
-function stableStringify(obj) {
-  if (obj === null || typeof obj !== "object") return JSON.stringify(obj);
-  if (Array.isArray(obj)) return `[${obj.map(stableStringify).join(",")}]`;
-  const keys = Object.keys(obj).sort();
-  return `{${keys.map((k) => JSON.stringify(k) + ":" + stableStringify(obj[k])).join(",")}}`;
-}
-
-function bothubHmacStable(payload, secret) {
-  const raw = stableStringify(payload);
-  return crypto.createHmac("sha256", secret).update(raw).digest("hex");
-}
-
-function bothubHmacJson(payload, secret) {
-  return crypto.createHmac("sha256", secret).update(JSON.stringify(payload)).digest("hex");
-}
-
-function getHubSignature(req) {
-  const h =
-    req.get("X-HUB-SIGNATURE") ||
-    req.get("x-hub-signature") ||
-    req.get("X-Hub-Signature") ||
-    req.get("X-HUB-SIGNATURE-256") ||
-    req.get("X-Hub-Signature-256") ||
-    req.get("x-hub-signature-256") ||
-    "";
-
-  const sig = String(h || "").trim();
-  if (!sig) return "";
-  return sig.startsWith("sha256=") ? sig.slice("sha256=".length) : sig;
-}
-
-function timingSafeEqualHex(aHex, bHex) {
-  const a = Buffer.from(String(aHex || ""), "utf8");
-  const b = Buffer.from(String(bHex || ""), "utf8");
-  if (!a.length || a.length !== b.length) return false;
-  return crypto.timingSafeEqual(a, b);
-}
-
-function verifyHubSignature(reqBody, signatureHex, secret) {
-  if (!signatureHex || !secret) return false;
-
-  const expectedStable = bothubHmacStable(reqBody, secret);
-  if (timingSafeEqualHex(signatureHex, expectedStable)) return true;
-
-  const expectedJson = bothubHmacJson(reqBody, secret);
-  if (timingSafeEqualHex(signatureHex, expectedJson)) return true;
-
-  return false;
-}
-
-async function bothubReportMessage(payload) {
-  if (!BOTHUB_WEBHOOK_URL || !BOTHUB_WEBHOOK_SECRET) return;
-
-  try {
-    const sig = bothubHmacStable(payload, BOTHUB_WEBHOOK_SECRET);
-    await axios.post(BOTHUB_WEBHOOK_URL, payload, {
-      headers: {
-        "Content-Type": "application/json",
-        "X-HUB-SIGNATURE": sig,
-      },
-      timeout: BOTHUB_TIMEOUT_MS,
-    });
-  } catch (e) {
-    console.error("Bothub report failed:", e?.response?.data || e?.message || e);
-  }
-}
-
-// ✅ meta para audio/ubicación/attachments
-function extractInboundMeta(msg) {
-  if (!msg) return {};
-
-  if (msg?.type === "audio") {
-    return {
-      kind: "AUDIO",
-      mediaId: msg?.audio?.id,
-      mimeType: msg?.audio?.mime_type,
-      voice: msg?.audio?.voice,
-    };
-  }
-
-  if (msg?.type === "location") {
-    return {
-      kind: "LOCATION",
-      latitude: msg?.location?.latitude,
-      longitude: msg?.location?.longitude,
-      name: msg?.location?.name,
-      address: msg?.location?.address,
-    };
-  }
-
-  if (msg?.type === "image")
-    return { kind: "IMAGE", mediaId: msg?.image?.id, mimeType: msg?.image?.mime_type, caption: msg?.image?.caption };
-  if (msg?.type === "video")
-    return { kind: "VIDEO", mediaId: msg?.video?.id, mimeType: msg?.video?.mime_type, caption: msg?.video?.caption };
-  if (msg?.type === "document")
-    return {
-      kind: "DOCUMENT",
-      mediaId: msg?.document?.id,
-      mimeType: msg?.document?.mime_type,
-      filename: msg?.document?.filename,
-    };
-  if (msg?.type === "sticker")
-    return { kind: "STICKER", mediaId: msg?.sticker?.id, mimeType: msg?.sticker?.mime_type };
-
-  if (msg?.type === "contacts") return { kind: "CONTACTS", count: msg?.contacts?.length || 0 };
-  if (msg?.type === "reaction") return { kind: "REACTION", emoji: msg?.reaction?.emoji, messageId: msg?.reaction?.message_id };
-
-  return { kind: msg?.type ? String(msg.type).toUpperCase() : "UNKNOWN" };
-}
-
-// =========================
 // WhatsApp send text / interactive list
-// ✅ + report OUTBOUND to BotHub
+// ✅ (solo añadimos reporte al Hub)
 // =========================
-async function sendWhatsAppText(to, text) {
+async function sendWhatsAppText(to, text, reportSource = "BOT") {
   const url = `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`;
   await axios.post(
     url,
@@ -409,12 +426,12 @@ async function sendWhatsAppText(to, text) {
     { headers: { Authorization: `Bearer ${WA_TOKEN}` } }
   );
 
-  // ✅ OUTBOUND -> Hub
+  // ✅ OUTBOUND al Hub
   await bothubReportMessage({
     direction: "OUTBOUND",
     to: String(to),
     body: String(text),
-    source: "BOT",
+    source: reportSource,
     kind: "TEXT",
   });
 }
@@ -448,10 +465,9 @@ async function sendServicesList(to) {
     { headers: { Authorization: `Bearer ${WA_TOKEN}` } }
   );
 
-  // ✅ OUTBOUND -> Hub (representación como texto)
+  // ✅ OUTBOUND al Hub (representación texto + meta)
   const rendered =
-    `*Nuestros servicios*\n` +
-    `Selecciona un servicio para agendar tu cita 👇 (O si prefieres, escríbelo)\n\n` +
+    `*Nuestros servicios*\nSelecciona un servicio para agendar tu cita 👇\n(O si prefieres, escríbelo)\n\n` +
     rows.map((r) => `• [${r.id}] ${r.title}`).join("\n");
 
   await bothubReportMessage({
@@ -460,11 +476,11 @@ async function sendServicesList(to) {
     body: rendered,
     source: "BOT",
     kind: "LIST",
-    meta: { headerText: "Nuestros servicios", bodyText: "Selecciona un servicio para agendar tu cita 👇\n(O si prefieres, escríbelo)", rows },
+    meta: { rows },
   });
 }
 
-// Primer mensaje con opción A/B
+// NEW: Primer mensaje con opción A/B (texto + botones)
 function servicesEmojiText() {
   return (
     `👋 ¡Hola! Soy el asistente de *${CLINIC_NAME}*.\n\n` +
@@ -611,6 +627,7 @@ async function getAvailableSlotsTool({ service, from, to }) {
 // =========================
 async function bookAppointmentTool({ patient_name, phone, slot_id, service, notes, slot_start, slot_end }) {
   const calendar = getCalendarClient();
+
   if (!slot_start || !slot_end) throw new Error("Missing slot_start/slot_end");
 
   const event = await calendar.events.insert({
@@ -672,7 +689,7 @@ async function cancelAppointmentTool({ appointment_id, reason }) {
 
   const event = await calendar.events.get({ calendarId: GOOGLE_CALENDAR_ID, eventId: appointment_id });
 
-  const summary = event.data.summary || note;
+  const summary = event.data.summary || "Cita";
   await calendar.events.patch({
     calendarId: GOOGLE_CALENDAR_ID,
     eventId: appointment_id,
@@ -696,7 +713,7 @@ async function handoffToHumanTool({ summary }) {
 }
 
 // =========================
-// Date parsing
+// Date parsing (improved)
 // =========================
 const DOW = {
   lunes: 1,
@@ -757,6 +774,7 @@ function nextWeekdayFromTodayUTC(targetIsoDow, tz, isNext = false) {
   return addLocalDaysUTC(todayLocal, diff, tz);
 }
 
+// NEW: range helpers
 function rangeForWholeMonth(year, month) {
   const from = zonedTimeToUtc({ year, month, day: 1, hour: 0, minute: 0 }, CLINIC_TIMEZONE);
   const toMonth = month === 12 ? { year: year + 1, month: 1 } : { year, month: month + 1 };
@@ -767,6 +785,7 @@ function rangeForWholeMonth(year, month) {
 function parseDateRangeFromText(userText) {
   const t = normalizeText(userText);
 
+  // hoy / mañana / pasado mañana
   if (t.includes("hoy")) {
     const from = startOfLocalDayUTC(new Date(), CLINIC_TIMEZONE);
     const to = addLocalDaysUTC(from, 1, CLINIC_TIMEZONE);
@@ -783,12 +802,14 @@ function parseDateRangeFromText(userText) {
     return { from: from.toISOString(), to: to.toISOString(), label: "mañana" };
   }
 
+  // "la semana que viene"
   if (t.includes("semana que viene") || t.includes("la semana que viene") || t.includes("siguiente semana")) {
     const from = addLocalDaysUTC(startOfLocalDayUTC(new Date(), CLINIC_TIMEZONE), 1, CLINIC_TIMEZONE);
     const to = addLocalDaysUTC(from, 7, CLINIC_TIMEZONE);
     return { from: from.toISOString(), to: to.toISOString(), label: "la semana que viene" };
   }
 
+  // "en junio"
   for (const [mname, mnum] of Object.entries(MONTHS)) {
     if (t === mname || t.includes(`en ${mname}`) || t.includes(`para ${mname}`)) {
       const nowP = getZonedParts(new Date(), CLINIC_TIMEZONE);
@@ -799,6 +820,7 @@ function parseDateRangeFromText(userText) {
     }
   }
 
+  // "el viernes" / "proximo martes"
   for (const [name, iso] of Object.entries(DOW)) {
     if (t.includes(name)) {
       const isNext = t.includes("proximo") || t.includes("próximo") || t.includes("que viene") || t.includes("siguiente");
@@ -808,6 +830,7 @@ function parseDateRangeFromText(userText) {
     }
   }
 
+  // "14 de junio"
   const m1 = t.match(/(\d{1,2})\s+de\s+([a-záéíóú]+)(\s+de\s+(\d{4}))?/);
   if (m1) {
     const day = parseInt(m1[1], 10);
@@ -1117,20 +1140,25 @@ function extractIncomingText(msg) {
     return br.id || br.title || "";
   }
 
-  // audio/location/media => para que el bot no se quede en blanco
-  if (msg?.type === "audio") return "[AUDIO]";
+  // Nota de voz / audio
+  if (msg?.type === "audio" && msg?.audio?.id) return "[AUDIO]";
+
+  // Ubicación
   if (msg?.type === "location" && msg?.location) {
     const { latitude, longitude, name, address } = msg.location;
     return `📍 Ubicación: ${name || ""} ${address || ""} (${latitude}, ${longitude})`.trim();
   }
-  if (msg?.type === "image") return "[IMAGE]";
-  if (msg?.type === "video") return "[VIDEO]";
-  if (msg?.type === "document") return "[DOCUMENT]";
-  if (msg?.type === "sticker") return "[STICKER]";
-  if (msg?.type === "contacts") return "[CONTACTS]";
-  if (msg?.type === "reaction") return `[REACTION] ${msg?.reaction?.emoji || ""}`.trim();
 
-  return "";
+  // Imagen / video / documento / sticker
+  if (msg?.type === "image" && msg?.image?.id) return "[IMAGE]";
+  if (msg?.type === "video" && msg?.video?.id) return "[VIDEO]";
+  if (msg?.type === "document" && msg?.document?.id) return "[DOCUMENT]";
+  if (msg?.type === "sticker" && msg?.sticker?.id) return "[STICKER]";
+
+  if (msg?.type === "contacts" && msg?.contacts?.length) return "[CONTACTS]";
+  if (msg?.type === "reaction" && msg?.reaction) return `[REACTION] ${msg.reaction.emoji || ""}`.trim();
+
+  return `[${(msg?.type || "UNKNOWN").toUpperCase()}]`;
 }
 
 function detectServiceKeyFromUser(text) {
@@ -1155,12 +1183,12 @@ function detectServiceKeyFromUser(text) {
   return null;
 }
 
-// =========================
+// =====================================================
 // ✅ NEW: endpoint para recibir mensaje del AGENTE desde BotHub
 // POST /agent_message
 // body: { conversationId, waTo, text, agentUserId }
 // header: X-HUB-SIGNATURE (HMAC)
-// =========================
+// =====================================================
 app.post("/agent_message", async (req, res) => {
   try {
     if (!BOTHUB_WEBHOOK_SECRET) {
@@ -1182,19 +1210,8 @@ app.post("/agent_message", async (req, res) => {
     if (!waTo || !String(waTo).trim()) return res.status(400).json({ error: "waTo is required" });
     if (!text || !String(text).trim()) return res.status(400).json({ error: "text is required" });
 
-    // Enviar por WhatsApp
-    await sendWhatsAppText(String(waTo), String(text));
-
-    // Reportar al Hub como OUTBOUND (source AGENT)
-    await bothubReportMessage({
-      direction: "OUTBOUND",
-      to: String(waTo),
-      body: String(text),
-      source: "AGENT",
-      conversationId: req.body?.conversationId,
-      agentUserId: req.body?.agentUserId,
-      kind: "TEXT",
-    });
+    // ✅ Enviar por WhatsApp como AGENTE (y reportar al Hub como AGENT)
+    await sendWhatsAppText(String(waTo), String(text), "AGENT");
 
     return res.json({ ok: true });
   } catch (e) {
@@ -1219,7 +1236,7 @@ app.post("/webhook", async (req, res) => {
 
     const session = getSession(from);
 
-    // dedupe por reintentos de Meta
+    // ✅ dedupe por reintentos de Meta
     const msgId = msg?.id;
     if (msgId && session.lastMsgId === msgId) return res.sendStatus(200);
     if (msgId) session.lastMsgId = msgId;
@@ -1230,7 +1247,7 @@ app.post("/webhook", async (req, res) => {
 
     if (!userText) return res.sendStatus(200);
 
-    // ✅ INBOUND -> Hub (con meta)
+    // ✅ Reportar INBOUND al Hub (texto + meta)
     const inboundMeta = extractInboundMeta(msg);
     await bothubReportMessage({
       direction: "INBOUND",
@@ -1443,6 +1460,7 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
+    // If service detected, try parse date
     if (serviceKey) {
       const range = parseDateRangeFromText(userText);
 
@@ -1478,6 +1496,7 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
+    // If they answered a day and we have a pending service
     if (!serviceKey && session.pendingService) {
       const range = parseDateRangeFromText(userText);
       if (range) {
@@ -1608,4 +1627,4 @@ setInterval(reminderLoop, 5 * 60 * 1000);
 // =========================
 // Start
 // =========================
-app.listen(PORT, () => console.log(`✅ ${CLINIC_NAME} bot running on :${PORT}`));
+app.listen(PORT, () => console.log(`Bot running on :${PORT}`));
