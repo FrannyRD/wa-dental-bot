@@ -1,3 +1,4 @@
+// index.ts (Clínica Tekko Bot) — ✅ SOLO lo necesario para que BotHub muestre TODO INBOUND/OUTBOUND
 import express from "express";
 import axios from "axios";
 import crypto from "crypto";
@@ -28,12 +29,127 @@ const REMINDER_24H = (process.env.REMINDER_24H || "1") === "1";
 const REMINDER_2H = (process.env.REMINDER_2H || "1") === "1";
 
 // =========================
+// ✅ BOTHUB (mínimos para que el Hub vea todo)
+// =========================
+const BOTHUB_WEBHOOK_URL = process.env.BOTHUB_WEBHOOK_URL || ""; // .../api/webhooks/webhook/<BOT_ID>
+const BOTHUB_WEBHOOK_SECRET = process.env.BOTHUB_WEBHOOK_SECRET || "";
+const BOTHUB_TIMEOUT_MS = Number(process.env.BOTHUB_TIMEOUT_MS || 6000);
+
+// =====================================================
+// ✅ Stable stringify + firma HMAC (igual que Tekko Lead)
+// =====================================================
+function stableStringify(obj: any): string {
+  if (obj === null || typeof obj !== "object") return JSON.stringify(obj);
+  if (Array.isArray(obj)) return `[${obj.map(stableStringify).join(",")}]`;
+  const keys = Object.keys(obj).sort();
+  return `{${keys.map((k) => JSON.stringify(k) + ":" + stableStringify((obj as any)[k])).join(",")}}`;
+}
+
+function bothubHmacStable(payload: any, secret: string) {
+  const raw = stableStringify(payload);
+  return crypto.createHmac("sha256", secret).update(raw).digest("hex");
+}
+
+function bothubHmacJson(payload: any, secret: string) {
+  return crypto.createHmac("sha256", secret).update(JSON.stringify(payload)).digest("hex");
+}
+
+function getHubSignature(req: any) {
+  const h =
+    req.get("X-HUB-SIGNATURE") ||
+    req.get("x-hub-signature") ||
+    req.get("X-Hub-Signature") ||
+    req.get("X-HUB-SIGNATURE-256") ||
+    req.get("X-Hub-Signature-256") ||
+    req.get("x-hub-signature-256") ||
+    "";
+
+  const sig = String(h || "").trim();
+  if (!sig) return "";
+  return sig.startsWith("sha256=") ? sig.slice("sha256=".length) : sig;
+}
+
+function timingSafeEqualHex(aHex: string, bHex: string) {
+  const a = Buffer.from(String(aHex || ""), "utf8");
+  const b = Buffer.from(String(bHex || ""), "utf8");
+  if (!a.length || a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+function verifyHubSignature(reqBody: any, signatureHex: string, secret: string) {
+  if (!signatureHex || !secret) return false;
+
+  const expectedStable = bothubHmacStable(reqBody, secret);
+  if (timingSafeEqualHex(signatureHex, expectedStable)) return true;
+
+  const expectedJson = bothubHmacJson(reqBody, secret);
+  if (timingSafeEqualHex(signatureHex, expectedJson)) return true;
+
+  return false;
+}
+
+async function bothubReportMessage(payload: any) {
+  // ✅ No rompe el bot si no está configurado
+  if (!BOTHUB_WEBHOOK_URL || !BOTHUB_WEBHOOK_SECRET) return;
+
+  try {
+    const sig = bothubHmacStable(payload, BOTHUB_WEBHOOK_SECRET);
+    await axios.post(BOTHUB_WEBHOOK_URL, payload, {
+      headers: {
+        "Content-Type": "application/json",
+        "X-HUB-SIGNATURE": sig,
+      },
+      timeout: BOTHUB_TIMEOUT_MS,
+    });
+  } catch (e: any) {
+    console.error("Bothub report failed:", e?.response?.data || e?.message || e);
+  }
+}
+
+// ✅ Para que el Hub “vea todo” (audio/ubicación/docs)
+function extractInboundMeta(msg: any) {
+  if (!msg) return {};
+
+  if (msg?.type === "audio") {
+    return {
+      kind: "AUDIO",
+      mediaId: msg?.audio?.id,
+      mimeType: msg?.audio?.mime_type,
+      voice: msg?.audio?.voice,
+    };
+  }
+
+  if (msg?.type === "location") {
+    return {
+      kind: "LOCATION",
+      latitude: msg?.location?.latitude,
+      longitude: msg?.location?.longitude,
+      name: msg?.location?.name,
+      address: msg?.location?.address,
+    };
+  }
+
+  if (msg?.type === "image")
+    return { kind: "IMAGE", mediaId: msg?.image?.id, mimeType: msg?.image?.mime_type, caption: msg?.image?.caption };
+  if (msg?.type === "video")
+    return { kind: "VIDEO", mediaId: msg?.video?.id, mimeType: msg?.video?.mime_type, caption: msg?.video?.caption };
+  if (msg?.type === "document")
+    return { kind: "DOCUMENT", mediaId: msg?.document?.id, mimeType: msg?.document?.mime_type, filename: msg?.document?.filename };
+  if (msg?.type === "sticker") return { kind: "STICKER", mediaId: msg?.sticker?.id, mimeType: msg?.sticker?.mime_type };
+
+  if (msg?.type === "contacts") return { kind: "CONTACTS", count: msg?.contacts?.length || 0 };
+  if (msg?.type === "reaction") return { kind: "REACTION", emoji: msg?.reaction?.emoji, messageId: msg?.reaction?.message_id };
+
+  return { kind: msg?.type ? String(msg.type).toUpperCase() : "UNKNOWN" };
+}
+
+// =========================
 // Express (raw body for signature check)
 // =========================
 const app = express();
 app.use(
   express.json({
-    verify: (req, res, buf) => {
+    verify: (req: any, _res, buf) => {
       req.rawBody = buf;
     },
   })
@@ -43,8 +159,8 @@ app.use(
 // Simple memory (MVP)
 // In prod: Redis / DB
 // =========================
-const sessions = new Map();
-function getSession(userId) {
+const sessions = new Map<string, any>();
+function getSession(userId: string) {
   if (!sessions.has(userId)) {
     sessions.set(userId, {
       messages: [],
@@ -55,9 +171,9 @@ function getSession(userId) {
       pendingRange: null,
       pendingName: null,
       lastBooking: null, // {appointment_id,start,end,service,patient_name,phone}
-      greeted: false, // NEW: to show services menu once per session
+      greeted: false,
 
-      // ✅ NEW: dedupe webhook retries
+      // ✅ dedupe webhook retries
       lastMsgId: null,
     });
   }
@@ -65,7 +181,7 @@ function getSession(userId) {
 }
 
 // =========================
-// Services (requested list)
+// Services
 // =========================
 const SERVICES = [
   { key: "estetica_dental", title: "Estética dental", id: "svc_estetica" },
@@ -76,12 +192,12 @@ const SERVICES = [
   { key: "odontopediatria", title: "Odontopediatría", id: "svc_odontopediatria" },
 ];
 
-const SERVICE_ID_TO_KEY = Object.fromEntries(SERVICES.map((s) => [s.id, s.key]));
+const SERVICE_ID_TO_KEY: Record<string, string> = Object.fromEntries(SERVICES.map((s) => [s.id, s.key]));
 
 // =========================
 // Helpers
 // =========================
-function safeJson(str, fallback) {
+function safeJson(str: any, fallback: any) {
   try {
     return JSON.parse(str);
   } catch {
@@ -102,7 +218,6 @@ function defaultWorkHours() {
 }
 
 function defaultServiceDuration() {
-  // tus servicios (puedes sobre-escribir con SERVICE_DURATION_JSON)
   return {
     estetica_dental: 60,
     ortodoncia: 30,
@@ -114,7 +229,7 @@ function defaultServiceDuration() {
   };
 }
 
-function verifyMetaSignature(req) {
+function verifyMetaSignature(req: any) {
   if (!META_APP_SECRET) return true;
   const signature = req.get("X-Hub-Signature-256");
   if (!signature) return false;
@@ -133,11 +248,11 @@ function verifyMetaSignature(req) {
   }
 }
 
-function addMinutes(date, minutes) {
+function addMinutes(date: Date, minutes: number) {
   return new Date(date.getTime() + minutes * 60000);
 }
 
-function normalizeText(t) {
+function normalizeText(t: string) {
   return (t || "")
     .toLowerCase()
     .normalize("NFD")
@@ -146,56 +261,29 @@ function normalizeText(t) {
     .trim();
 }
 
-function weekdayKeyFromISOWeekday(isoWeekday) {
-  // isoWeekday: 1=Mon..7=Sun
+function weekdayKeyFromISOWeekday(isoWeekday: number) {
   return ["", "mon", "tue", "wed", "thu", "fri", "sat", "sun"][isoWeekday];
 }
 
-// NEW: detectar saludo para evitar doble respuesta
-function isGreeting(textNorm) {
+function isGreeting(textNorm: string) {
   const t = textNorm || "";
-  // saludos típicos (cortos)
-  const greetings = [
-    "hola",
-    "buen dia",
-    "buen día",
-    "buenos dias",
-    "buenos días",
-    "buenas",
-    "buenas tardes",
-    "buenas noches",
-    "saludos",
-    "hey",
-    "hi",
-  ];
+  const greetings = ["hola", "buen dia", "buen día", "buenos dias", "buenos días", "buenas", "buenas tardes", "buenas noches", "saludos", "hey", "hi"];
   const isOnlyGreeting =
     greetings.some((g) => t === g || t.startsWith(g + " ")) ||
     /^(hola+|buenas+)\b/.test(t);
 
-  // si trae intención de cita, no lo tratamos como “saludo simple”
   const hasBookingIntent =
-    t.includes("cita") ||
-    t.includes("agendar") ||
-    t.includes("agenda") ||
-    t.includes("reservar") ||
-    t.includes("reserva") ||
-    t.includes("reprogram") ||
-    t.includes("cancel");
+    t.includes("cita") || t.includes("agendar") || t.includes("agenda") || t.includes("reservar") || t.includes("reserva") || t.includes("reprogram") || t.includes("cancel");
 
   return isOnlyGreeting && !hasBookingIntent && t.length <= 40;
 }
 
-// ✅ NEW: mensaje corto para 2do saludo (sin menú)
 function quickHelpText() {
-  return (
-    `¡Hola! 😊\n` +
-    `¿Qué servicio deseas agendar?\n\n` +
-    `Puedes escribir el servicio (ej: "Ortodoncia") o escribir "servicios" para ver el menú.`
-  );
+  return `¡Hola! 😊\n¿Qué servicio deseas agendar?\n\nPuedes escribir el servicio (ej: "Ortodoncia") o escribir "servicios" para ver el menú.`;
 }
 
 // ---- Timezone utilities ----
-function getZonedParts(date, timeZone) {
+function getZonedParts(date: Date, timeZone: string) {
   const fmt = new Intl.DateTimeFormat("en-CA", {
     timeZone,
     year: "numeric",
@@ -207,7 +295,7 @@ function getZonedParts(date, timeZone) {
     hour12: false,
   });
   const parts = fmt.formatToParts(date);
-  const obj = {};
+  const obj: any = {};
   for (const p of parts) obj[p.type] = p.value;
   return {
     year: parseInt(obj.year, 10),
@@ -219,19 +307,19 @@ function getZonedParts(date, timeZone) {
   };
 }
 
-function getOffsetMinutes(date, timeZone) {
+function getOffsetMinutes(date: Date, timeZone: string) {
   const p = getZonedParts(date, timeZone);
   const asUTC = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
   return (asUTC - date.getTime()) / 60000;
 }
 
-function zonedTimeToUtc({ year, month, day, hour, minute, second = 0 }, timeZone) {
+function zonedTimeToUtc({ year, month, day, hour, minute, second = 0 }: any, timeZone: string) {
   const guess = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
   const offsetMin = getOffsetMinutes(guess, timeZone);
   return new Date(Date.UTC(year, month - 1, day, hour, minute, second) - offsetMin * 60000);
 }
 
-function formatTimeInTZ(iso, timeZone) {
+function formatTimeInTZ(iso: string, timeZone: string) {
   const d = new Date(iso);
   return new Intl.DateTimeFormat("es-DO", {
     timeZone,
@@ -241,7 +329,7 @@ function formatTimeInTZ(iso, timeZone) {
   }).format(d);
 }
 
-function formatDateInTZ(iso, timeZone) {
+function formatDateInTZ(iso: string, timeZone: string) {
   const d = new Date(iso);
   return new Intl.DateTimeFormat("es-DO", {
     timeZone,
@@ -252,34 +340,27 @@ function formatDateInTZ(iso, timeZone) {
   }).format(d);
 }
 
-function isThanks(textNorm) {
-  return ["gracias", "ok", "okay", "listo", "perfecto", "dale", "bien", "genial"].some(
-    (k) => textNorm === k || textNorm.includes(k)
-  );
+function isThanks(textNorm: string) {
+  return ["gracias", "ok", "okay", "listo", "perfecto", "dale", "bien", "genial"].some((k) => textNorm === k || textNorm.includes(k));
 }
 
-function looksLikeCancel(textNorm) {
-  return ["cancelar", "cancela", "anular", "anula", "no puedo", "ya no", "cancelacion"].some((k) =>
-    textNorm.includes(k)
-  );
+function looksLikeCancel(textNorm: string) {
+  return ["cancelar", "cancela", "anular", "anula", "no puedo", "ya no", "cancelacion"].some((k) => textNorm.includes(k));
 }
 
-function looksLikeReschedule(textNorm) {
-  return ["reprogramar", "reprograma", "cambiar", "cambio", "mover", "posponer", "otro horario"].some((k) =>
-    textNorm.includes(k)
-  );
+function looksLikeReschedule(textNorm: string) {
+  return ["reprogramar", "reprograma", "cambiar", "cambio", "mover", "posponer", "otro horario"].some((k) => textNorm.includes(k));
 }
 
-function looksLikeNewAppointment(textNorm) {
-  return ["nueva cita", "otra cita", "agendar", "reservar", "cita nueva", "quiero cita"].some((k) =>
-    textNorm.includes(k)
-  );
+function looksLikeNewAppointment(textNorm: string) {
+  return ["nueva cita", "otra cita", "agendar", "reservar", "cita nueva", "quiero cita"].some((k) => textNorm.includes(k));
 }
 
 // =========================
 // WhatsApp send text / interactive list
+// ✅ (solo añadido) reportar OUTBOUND al Hub
 // =========================
-async function sendWhatsAppText(to, text) {
+async function sendWhatsAppText(to: string, text: string, source: "BOT" | "AGENT" = "BOT") {
   const url = `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`;
   await axios.post(
     url,
@@ -291,9 +372,18 @@ async function sendWhatsAppText(to, text) {
     },
     { headers: { Authorization: `Bearer ${WA_TOKEN}` } }
   );
+
+  // ✅ OUTBOUND al Hub
+  await bothubReportMessage({
+    direction: "OUTBOUND",
+    to: String(to),
+    body: String(text),
+    source,
+    kind: "TEXT",
+  });
 }
 
-async function sendServicesList(to) {
+async function sendServicesList(to: string) {
   const url = `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`;
 
   const rows = SERVICES.map((s) => ({
@@ -321,9 +411,22 @@ async function sendServicesList(to) {
     },
     { headers: { Authorization: `Bearer ${WA_TOKEN}` } }
   );
+
+  // ✅ OUTBOUND al Hub (representación)
+  const rendered =
+    `*Nuestros servicios*\nSelecciona un servicio para agendar tu cita 👇 (O si prefieres, escríbelo)\n\n` +
+    rows.map((r) => `• [${r.id}] ${r.title}`).join("\n");
+
+  await bothubReportMessage({
+    direction: "OUTBOUND",
+    to: String(to),
+    body: rendered,
+    source: "BOT",
+    kind: "LIST",
+    meta: { rows },
+  });
 }
 
-// NEW: Primer mensaje con opción A/B (texto + botones)
 function servicesEmojiText() {
   return (
     `👋 ¡Hola! Soy el asistente de *${CLINIC_NAME}*.\n\n` +
@@ -360,7 +463,7 @@ function getCalendarClient() {
 // =========================
 // Calendar: FreeBusy => generate slots (timezone-safe)
 // =========================
-async function getBusyRanges(calendar, timeMinISO, timeMaxISO) {
+async function getBusyRanges(calendar: any, timeMinISO: string, timeMaxISO: string) {
   const fb = await calendar.freebusy.query({
     requestBody: {
       timeMin: timeMinISO,
@@ -371,33 +474,27 @@ async function getBusyRanges(calendar, timeMinISO, timeMaxISO) {
   });
 
   const busy = fb.data.calendars?.[GOOGLE_CALENDAR_ID]?.busy || [];
-  return busy.map((b) => ({
+  return busy.map((b: any) => ({
     start: new Date(b.start),
     end: new Date(b.end),
   }));
 }
 
-function overlaps(aStart, aEnd, bStart, bEnd) {
+function overlaps(aStart: Date, aEnd: Date, bStart: Date, bEnd: Date) {
   return aStart < bEnd && aEnd > bStart;
 }
 
-function buildCandidateSlotsZoned({ service, fromISO, toISO, durationMin }) {
+function buildCandidateSlotsZoned({ service, fromISO, toISO, durationMin }: any) {
   const from = new Date(fromISO);
   const to = new Date(toISO);
 
   const fromP = getZonedParts(from, CLINIC_TIMEZONE);
   const toP = getZonedParts(to, CLINIC_TIMEZONE);
 
-  let curUTC = zonedTimeToUtc(
-    { year: fromP.year, month: fromP.month, day: fromP.day, hour: 0, minute: 0 },
-    CLINIC_TIMEZONE
-  );
-  const endUTC = zonedTimeToUtc(
-    { year: toP.year, month: toP.month, day: toP.day, hour: 23, minute: 59 },
-    CLINIC_TIMEZONE
-  );
+  let curUTC = zonedTimeToUtc({ year: fromP.year, month: fromP.month, day: fromP.day, hour: 0, minute: 0 }, CLINIC_TIMEZONE);
+  const endUTC = zonedTimeToUtc({ year: toP.year, month: toP.month, day: toP.day, hour: 23, minute: 59 }, CLINIC_TIMEZONE);
 
-  const slots = [];
+  const slots: any[] = [];
 
   while (curUTC <= endUTC) {
     const curLocal = getZonedParts(curUTC, CLINIC_TIMEZONE);
@@ -405,11 +502,11 @@ function buildCandidateSlotsZoned({ service, fromISO, toISO, durationMin }) {
     const js = new Date(Date.UTC(curLocal.year, curLocal.month - 1, curLocal.day, 12, 0, 0));
     const isoWeekday = ((js.getUTCDay() + 6) % 7) + 1;
     const key = weekdayKeyFromISOWeekday(isoWeekday);
-    const wh = WORK_HOURS[key];
+    const wh = (WORK_HOURS as any)[key];
 
     if (wh) {
-      const [sh, sm] = wh.start.split(":").map((n) => parseInt(n, 10));
-      const [eh, em] = wh.end.split(":").map((n) => parseInt(n, 10));
+      const [sh, sm] = wh.start.split(":").map((n: string) => parseInt(n, 10));
+      const [eh, em] = wh.end.split(":").map((n: string) => parseInt(n, 10));
 
       let cursorMin = sh * 60 + sm;
       const endMin = eh * 60 + em;
@@ -420,10 +517,7 @@ function buildCandidateSlotsZoned({ service, fromISO, toISO, durationMin }) {
         const h = Math.floor(cursorMin / 60);
         const m = cursorMin % 60;
 
-        const slotStartUTC = zonedTimeToUtc(
-          { year: curLocal.year, month: curLocal.month, day: curLocal.day, hour: h, minute: m },
-          CLINIC_TIMEZONE
-        );
+        const slotStartUTC = zonedTimeToUtc({ year: curLocal.year, month: curLocal.month, day: curLocal.day, hour: h, minute: m }, CLINIC_TIMEZONE);
         const slotEndUTC = new Date(slotStartUTC.getTime() + durationMin * 60000);
 
         if (slotStartUTC >= from && slotEndUTC <= to) {
@@ -439,27 +533,24 @@ function buildCandidateSlotsZoned({ service, fromISO, toISO, durationMin }) {
       }
     }
 
-    const nextDayUTC = zonedTimeToUtc(
-      { year: curLocal.year, month: curLocal.month, day: curLocal.day, hour: 0, minute: 0 },
-      CLINIC_TIMEZONE
-    );
+    const nextDayUTC = zonedTimeToUtc({ year: curLocal.year, month: curLocal.month, day: curLocal.day, hour: 0, minute: 0 }, CLINIC_TIMEZONE);
     curUTC = new Date(nextDayUTC.getTime() + 24 * 60 * 60000);
   }
 
   return slots;
 }
 
-async function getAvailableSlotsTool({ service, from, to }) {
+async function getAvailableSlotsTool({ service, from, to }: any) {
   const calendar = getCalendarClient();
 
-  const durationMin = SERVICE_DURATION[service] || SERVICE_DURATION["otro"] || 30;
+  const durationMin = (SERVICE_DURATION as any)[service] || (SERVICE_DURATION as any)["otro"] || 30;
   const busyRanges = await getBusyRanges(calendar, from, to);
   const candidates = buildCandidateSlotsZoned({ service, fromISO: from, toISO: to, durationMin });
 
-  const free = candidates.filter((c) => {
+  const free = candidates.filter((c: any) => {
     const cs = new Date(c.start);
     const ce = new Date(c.end);
-    return !busyRanges.some((b) => overlaps(cs, ce, b.start, b.end));
+    return !busyRanges.some((b: any) => overlaps(cs, ce, b.start, b.end));
   });
 
   return free.slice(0, 8);
@@ -468,9 +559,8 @@ async function getAvailableSlotsTool({ service, from, to }) {
 // =========================
 // Calendar: book / reschedule / cancel
 // =========================
-async function bookAppointmentTool({ patient_name, phone, slot_id, service, notes, slot_start, slot_end }) {
+async function bookAppointmentTool({ patient_name, phone, slot_id, service, notes, slot_start, slot_end }: any) {
   const calendar = getCalendarClient();
-
   if (!slot_start || !slot_end) throw new Error("Missing slot_start/slot_end");
 
   const event = await calendar.events.insert({
@@ -494,17 +584,10 @@ async function bookAppointmentTool({ patient_name, phone, slot_id, service, note
     },
   });
 
-  return {
-    appointment_id: event.data.id,
-    start: slot_start,
-    end: slot_end,
-    service,
-    patient_name,
-    phone,
-  };
+  return { appointment_id: event.data.id, start: slot_start, end: slot_end, service, patient_name, phone };
 }
 
-async function rescheduleAppointmentTool({ appointment_id, new_slot_id, new_start, new_end }) {
+async function rescheduleAppointmentTool({ appointment_id, new_slot_id, new_start, new_end }: any) {
   const calendar = getCalendarClient();
   if (!new_start || !new_end) throw new Error("Missing new_start/new_end");
 
@@ -527,7 +610,7 @@ async function rescheduleAppointmentTool({ appointment_id, new_slot_id, new_star
   return { ok: true, appointment_id: updated.data.id, new_start, new_end };
 }
 
-async function cancelAppointmentTool({ appointment_id, reason }) {
+async function cancelAppointmentTool({ appointment_id, reason }: any) {
   const calendar = getCalendarClient();
 
   const event = await calendar.events.get({ calendarId: GOOGLE_CALENDAR_ID, eventId: appointment_id });
@@ -551,14 +634,14 @@ async function cancelAppointmentTool({ appointment_id, reason }) {
   return { ok: true, appointment_id };
 }
 
-async function handoffToHumanTool({ summary }) {
+async function handoffToHumanTool({ summary }: any) {
   return { ok: true, routed: true, summary };
 }
 
 // =========================
 // Date parsing (improved)
 // =========================
-const DOW = {
+const DOW: Record<string, number> = {
   lunes: 1,
   martes: 2,
   miercoles: 3,
@@ -570,7 +653,7 @@ const DOW = {
   domingo: 7,
 };
 
-const MONTHS = {
+const MONTHS: Record<string, number> = {
   enero: 1,
   febrero: 2,
   marzo: 3,
@@ -586,22 +669,19 @@ const MONTHS = {
   diciembre: 12,
 };
 
-function startOfLocalDayUTC(date, tz) {
+function startOfLocalDayUTC(date: Date, tz: string) {
   const p = getZonedParts(date, tz);
   return zonedTimeToUtc({ year: p.year, month: p.month, day: p.day, hour: 0, minute: 0 }, tz);
 }
 
-function addLocalDaysUTC(dateUTC, days, tz) {
+function addLocalDaysUTC(dateUTC: Date, days: number, tz: string) {
   const p = getZonedParts(dateUTC, tz);
   const base = new Date(Date.UTC(p.year, p.month - 1, p.day, 12, 0, 0));
   base.setUTCDate(base.getUTCDate() + days);
-  return zonedTimeToUtc(
-    { year: base.getUTCFullYear(), month: base.getUTCMonth() + 1, day: base.getUTCDate(), hour: 0, minute: 0 },
-    tz
-  );
+  return zonedTimeToUtc({ year: base.getUTCFullYear(), month: base.getUTCMonth() + 1, day: base.getUTCDate(), hour: 0, minute: 0 }, tz);
 }
 
-function nextWeekdayFromTodayUTC(targetIsoDow, tz, isNext = false) {
+function nextWeekdayFromTodayUTC(targetIsoDow: number, tz: string, isNext = false) {
   const now = new Date();
   const todayLocal = startOfLocalDayUTC(now, tz);
 
@@ -617,18 +697,16 @@ function nextWeekdayFromTodayUTC(targetIsoDow, tz, isNext = false) {
   return addLocalDaysUTC(todayLocal, diff, tz);
 }
 
-// NEW: range helpers
-function rangeForWholeMonth(year, month) {
+function rangeForWholeMonth(year: number, month: number) {
   const from = zonedTimeToUtc({ year, month, day: 1, hour: 0, minute: 0 }, CLINIC_TIMEZONE);
   const toMonth = month === 12 ? { year: year + 1, month: 1 } : { year, month: month + 1 };
   const to = zonedTimeToUtc({ year: toMonth.year, month: toMonth.month, day: 1, hour: 0, minute: 0 }, CLINIC_TIMEZONE);
   return { from: from.toISOString(), to: to.toISOString() };
 }
 
-function parseDateRangeFromText(userText) {
+function parseDateRangeFromText(userText: string) {
   const t = normalizeText(userText);
 
-  // hoy / mañana / pasado mañana
   if (t.includes("hoy")) {
     const from = startOfLocalDayUTC(new Date(), CLINIC_TIMEZONE);
     const to = addLocalDaysUTC(from, 1, CLINIC_TIMEZONE);
@@ -645,14 +723,12 @@ function parseDateRangeFromText(userText) {
     return { from: from.toISOString(), to: to.toISOString(), label: "mañana" };
   }
 
-  // "la semana que viene"
   if (t.includes("semana que viene") || t.includes("la semana que viene") || t.includes("siguiente semana")) {
     const from = addLocalDaysUTC(startOfLocalDayUTC(new Date(), CLINIC_TIMEZONE), 1, CLINIC_TIMEZONE);
     const to = addLocalDaysUTC(from, 7, CLINIC_TIMEZONE);
     return { from: from.toISOString(), to: to.toISOString(), label: "la semana que viene" };
   }
 
-  // "en junio"
   for (const [mname, mnum] of Object.entries(MONTHS)) {
     if (t === mname || t.includes(`en ${mname}`) || t.includes(`para ${mname}`)) {
       const nowP = getZonedParts(new Date(), CLINIC_TIMEZONE);
@@ -663,7 +739,6 @@ function parseDateRangeFromText(userText) {
     }
   }
 
-  // "el viernes" / "proximo martes"
   for (const [name, iso] of Object.entries(DOW)) {
     if (t.includes(name)) {
       const isNext = t.includes("proximo") || t.includes("próximo") || t.includes("que viene") || t.includes("siguiente");
@@ -673,7 +748,6 @@ function parseDateRangeFromText(userText) {
     }
   }
 
-  // "14 de junio"
   const m1 = t.match(/(\d{1,2})\s+de\s+([a-záéíóú]+)(\s+de\s+(\d{4}))?/);
   if (m1) {
     const day = parseInt(m1[1], 10);
@@ -701,7 +775,7 @@ function parseDateRangeFromText(userText) {
 // =========================
 // Slot formatting
 // =========================
-function formatSlotsList(serviceKey, slots) {
+function formatSlotsList(serviceKey: string, slots: any[]) {
   if (!slots?.length) return null;
   const dateLabel = formatDateInTZ(slots[0].start, CLINIC_TIMEZONE);
   const prettyService = SERVICES.find((s) => s.key === serviceKey)?.title || serviceKey;
@@ -712,12 +786,10 @@ function formatSlotsList(serviceKey, slots) {
     return `${i + 1}. ${a} - ${b}`;
   });
 
-  return `Estos son los horarios disponibles para *${prettyService}* el *${dateLabel}*:\n\n${lines.join(
-    "\n"
-  )}\n\nResponde con el *número* (1,2,3...) o escribe la *hora* (ej: 10:00).`;
+  return `Estos son los horarios disponibles para *${prettyService}* el *${dateLabel}*:\n\n${lines.join("\n")}\n\nResponde con el *número* (1,2,3...) o escribe la *hora* (ej: 10:00).`;
 }
 
-function tryPickSlotFromUserText(session, userText) {
+function tryPickSlotFromUserText(session: any, userText: string) {
   const t = normalizeText(userText);
 
   const num = parseInt(t, 10);
@@ -730,7 +802,7 @@ function tryPickSlotFromUserText(session, userText) {
     const hh = parseInt(m[1], 10);
     const mm = m[2] ? parseInt(m[2], 10) : 0;
 
-    const found = session.lastSlots.find((s) => {
+    const found = session.lastSlots.find((s: any) => {
       const d = new Date(s.start);
       const parts = getZonedParts(d, CLINIC_TIMEZONE);
       return parts.hour === hh && parts.minute === mm;
@@ -744,7 +816,7 @@ function tryPickSlotFromUserText(session, userText) {
 // =========================
 // OpenAI: tool calling (kept)
 // =========================
-async function callOpenAI({ userId, userText, userPhone, extraSystem = "" }) {
+async function callOpenAI({ userId, userText, userPhone, extraSystem = "" }: any) {
   const session = getSession(userId);
 
   const today = new Date();
@@ -787,11 +859,7 @@ Tel usuario: ${userPhone}.
         description: "Obtiene horarios reales disponibles para un servicio en rango de fechas.",
         parameters: {
           type: "object",
-          properties: {
-            service: { type: "string" },
-            from: { type: "string" },
-            to: { type: "string" },
-          },
+          properties: { service: { type: "string" }, from: { type: "string" }, to: { type: "string" } },
           required: ["from", "to"],
         },
       },
@@ -823,12 +891,7 @@ Tel usuario: ${userPhone}.
         description: "Reagenda una cita a un nuevo slot (start/end exactos).",
         parameters: {
           type: "object",
-          properties: {
-            appointment_id: { type: "string" },
-            new_slot_id: { type: "string" },
-            new_start: { type: "string" },
-            new_end: { type: "string" },
-          },
+          properties: { appointment_id: { type: "string" }, new_slot_id: { type: "string" }, new_start: { type: "string" }, new_end: { type: "string" } },
           required: ["appointment_id", "new_slot_id", "new_start", "new_end"],
         },
       },
@@ -838,110 +901,58 @@ Tel usuario: ${userPhone}.
       function: {
         name: "cancel_appointment",
         description: "Cancela una cita por id.",
-        parameters: {
-          type: "object",
-          properties: {
-            appointment_id: { type: "string" },
-            reason: { type: "string" },
-          },
-          required: ["appointment_id"],
-        },
+        parameters: { type: "object", properties: { appointment_id: { type: "string" }, reason: { type: "string" } }, required: ["appointment_id"] },
       },
     },
     {
       type: "function",
-      function: {
-        name: "handoff_to_human",
-        description: "Deriva a humano si urgencia o caso especial.",
-        parameters: {
-          type: "object",
-          properties: {
-            summary: { type: "string" },
-          },
-          required: ["summary"],
-        },
-      },
+      function: { name: "handoff_to_human", description: "Deriva a humano si urgencia o caso especial.", parameters: { type: "object", properties: { summary: { type: "string" } }, required: ["summary"] } },
     },
   ];
 
   const resp = await axios.post(
     "https://api.openai.com/v1/chat/completions",
-    {
-      model: "gpt-4.1-mini",
-      messages,
-      tools,
-      tool_choice: "auto",
-      temperature: 0.2,
-    },
+    { model: "gpt-4.1-mini", messages, tools, tool_choice: "auto", temperature: 0.2 },
     { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
   );
 
   const msg = resp.data.choices?.[0]?.message;
 
   if (msg?.tool_calls?.length) {
-    const toolResults = [];
+    const toolResults: any[] = [];
     for (const tc of msg.tool_calls) {
       const name = tc.function.name;
       const args = JSON.parse(tc.function.arguments || "{}");
 
       if (name === "get_available_slots") {
         const slots = await getAvailableSlotsTool(args);
-        toolResults.push({
-          tool_call_id: tc.id,
-          role: "tool",
-          name,
-          content: JSON.stringify({ slots }),
-        });
+        toolResults.push({ tool_call_id: tc.id, role: "tool", name, content: JSON.stringify({ slots }) });
       }
 
       if (name === "book_appointment") {
         const booked = await bookAppointmentTool(args);
-        toolResults.push({
-          tool_call_id: tc.id,
-          role: "tool",
-          name,
-          content: JSON.stringify({ booked }),
-        });
+        toolResults.push({ tool_call_id: tc.id, role: "tool", name, content: JSON.stringify({ booked }) });
       }
 
       if (name === "reschedule_appointment") {
         const out = await rescheduleAppointmentTool(args);
-        toolResults.push({
-          tool_call_id: tc.id,
-          role: "tool",
-          name,
-          content: JSON.stringify(out),
-        });
+        toolResults.push({ tool_call_id: tc.id, role: "tool", name, content: JSON.stringify(out) });
       }
 
       if (name === "cancel_appointment") {
         const out = await cancelAppointmentTool(args);
-        toolResults.push({
-          tool_call_id: tc.id,
-          role: "tool",
-          name,
-          content: JSON.stringify(out),
-        });
+        toolResults.push({ tool_call_id: tc.id, role: "tool", name, content: JSON.stringify(out) });
       }
 
       if (name === "handoff_to_human") {
         const out = await handoffToHumanTool(args);
-        toolResults.push({
-          tool_call_id: tc.id,
-          role: "tool",
-          name,
-          content: JSON.stringify(out),
-        });
+        toolResults.push({ tool_call_id: tc.id, role: "tool", name, content: JSON.stringify(out) });
       }
     }
 
     const resp2 = await axios.post(
       "https://api.openai.com/v1/chat/completions",
-      {
-        model: "gpt-4.1-mini",
-        messages: [...messages, msg, ...toolResults],
-        temperature: 0.2,
-      },
+      { model: "gpt-4.1-mini", messages: [...messages, msg, ...toolResults], temperature: 0.2 },
       { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
     );
 
@@ -950,12 +961,47 @@ Tel usuario: ${userPhone}.
     return finalText || "¿En cuál servicio deseas agendar tu cita?";
   }
 
-  const text =
-    msg?.content?.trim() ||
-    "Hola 👋 ¿Deseas agendar una cita? Escribe el servicio o te muestro el menú.";
+  const text = msg?.content?.trim() || "Hola 👋 ¿Deseas agendar una cita? Escribe el servicio o te muestro el menú.";
   session.messages.push({ role: "assistant", content: text });
   return text;
 }
+
+// =========================
+// ✅ NEW: endpoint para mensajes del agente desde BotHub (opcional pero “como Tekko Lead”)
+// POST /agent_message { waTo, text, conversationId?, agentUserId? } + header X-HUB-SIGNATURE
+// =========================
+app.post("/agent_message", async (req: any, res) => {
+  try {
+    if (!BOTHUB_WEBHOOK_SECRET) return res.status(400).json({ error: "BOTHUB_WEBHOOK_SECRET not configured" });
+
+    const signature = getHubSignature(req);
+    const okSig = verifyHubSignature(req.body, signature, BOTHUB_WEBHOOK_SECRET);
+    if (!signature || !okSig) return res.status(401).json({ error: "Invalid signature" });
+
+    const { waTo, text } = req.body || {};
+    if (!waTo || !String(waTo).trim()) return res.status(400).json({ error: "waTo is required" });
+    if (!text || !String(text).trim()) return res.status(400).json({ error: "text is required" });
+
+    // enviar WhatsApp como AGENT (y reportar OUTBOUND como AGENT)
+    await sendWhatsAppText(String(waTo), String(text), "AGENT");
+
+    // (opcional) meta extra al Hub, por si tu Hub lo usa
+    await bothubReportMessage({
+      direction: "OUTBOUND",
+      to: String(waTo),
+      body: String(text),
+      source: "AGENT",
+      conversationId: req.body?.conversationId,
+      agentUserId: req.body?.agentUserId,
+      kind: "TEXT",
+    });
+
+    return res.json({ ok: true });
+  } catch (e: any) {
+    console.error("agent_message error:", e?.response?.data || e?.message || e);
+    return res.status(500).json({ error: "Internal error" });
+  }
+});
 
 // =========================
 // Webhooks
@@ -968,7 +1014,7 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-function extractIncomingText(msg) {
+function extractIncomingText(msg: any) {
   if (msg?.text?.body) return msg.text.body;
 
   if (msg?.type === "interactive" && msg?.interactive?.list_reply) {
@@ -981,10 +1027,23 @@ function extractIncomingText(msg) {
     return br.id || br.title || "";
   }
 
+  // ✅ Para que el Hub lo vea aunque tu bot no lo procese como texto:
+  if (msg?.type === "audio") return "[AUDIO]";
+  if (msg?.type === "location") {
+    const { latitude, longitude, name, address } = msg.location || {};
+    return `📍 Ubicación: ${name || ""} ${address || ""} (${latitude}, ${longitude})`.trim();
+  }
+  if (msg?.type === "image") return "[IMAGE]";
+  if (msg?.type === "video") return "[VIDEO]";
+  if (msg?.type === "document") return "[DOCUMENT]";
+  if (msg?.type === "sticker") return "[STICKER]";
+  if (msg?.type === "contacts") return "[CONTACTS]";
+  if (msg?.type === "reaction") return `[REACTION] ${msg?.reaction?.emoji || ""}`.trim();
+
   return "";
 }
 
-function detectServiceKeyFromUser(text) {
+function detectServiceKeyFromUser(text: string) {
   const t = normalizeText(text);
 
   if (SERVICE_ID_TO_KEY[text]) return SERVICE_ID_TO_KEY[text];
@@ -1006,7 +1065,7 @@ function detectServiceKeyFromUser(text) {
   return null;
 }
 
-app.post("/webhook", async (req, res) => {
+app.post("/webhook", async (req: any, res) => {
   try {
     if (!verifyMetaSignature(req)) return res.sendStatus(403);
 
@@ -1022,7 +1081,7 @@ app.post("/webhook", async (req, res) => {
 
     const session = getSession(from);
 
-    // ✅ NEW: dedupe por reintentos de Meta (evita mensajes duplicados)
+    // ✅ dedupe por reintentos de Meta
     const msgId = msg?.id;
     if (msgId && session.lastMsgId === msgId) return res.sendStatus(200);
     if (msgId) session.lastMsgId = msgId;
@@ -1033,10 +1092,21 @@ app.post("/webhook", async (req, res) => {
 
     if (!userText) return res.sendStatus(200);
 
+    // ✅ INBOUND al Hub (antes de tu lógica)
+    const inboundMeta = extractInboundMeta(msg);
+    await bothubReportMessage({
+      direction: "INBOUND",
+      from: String(from),
+      body: String(userText),
+      source: "WHATSAPP",
+      waMessageId: msg?.id,
+      name: value?.contacts?.[0]?.profile?.name,
+      kind: inboundMeta?.kind || (msg?.type ? String(msg.type).toUpperCase() : "UNKNOWN"),
+      meta: inboundMeta,
+    });
+
     // =========================
     // FIX: evitar respuestas múltiples al saludar
-    // - Solo saluda (A/B + menú) si es un saludo simple y NO trae intención de cita
-    // - En el 2do "hola", responde corto (sin menú)
     // =========================
     const detectedServiceEarly = detectServiceKeyFromUser(userText);
     const detectedRangeEarly = parseDateRangeFromText(userText);
@@ -1049,13 +1119,11 @@ app.post("/webhook", async (req, res) => {
       tNorm.includes("reprogram") ||
       tNorm.includes("cancel");
 
-    // ✅ NEW: si ya saludamos antes y vuelve a decir "hola", NO mandar menú otra vez
     if (session.greeted && session.state === "idle" && isGreeting(tNorm) && !hasEarlyIntent) {
       await sendWhatsAppText(from, quickHelpText());
       return res.sendStatus(200);
     }
 
-    // 1er saludo: A/B + menú
     if (!session.greeted && session.state === "idle" && isGreeting(tNorm) && !hasEarlyIntent) {
       session.greeted = true;
       await sendWhatsAppText(from, servicesEmojiText());
@@ -1063,7 +1131,6 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // (Opcional: marcar greeted en el primer mensaje “no saludo” para no repetir luego)
     if (!session.greeted && session.state === "idle") {
       session.greeted = true;
     }
@@ -1113,7 +1180,7 @@ app.post("/webhook", async (req, res) => {
         await sendWhatsAppText(
           from,
           `¡Perfecto! ✅\nTu cita queda confirmada.\n\n🦷 Servicio: ${
-            SERVICES.find((s) => s.key === b.service)?.title || b.service
+            SERVICES.find((s: any) => s.key === b.service)?.title || b.service
           }\n📅 Fecha: ${formatDateInTZ(b.start, CLINIC_TIMEZONE)}\n⏰ Hora: ${formatTimeInTZ(
             b.start,
             CLINIC_TIMEZONE
@@ -1135,10 +1202,7 @@ app.post("/webhook", async (req, res) => {
     if (session.state === "await_slot_choice" && session.lastSlots?.length) {
       const picked = tryPickSlotFromUserText(session, userText);
       if (!picked) {
-        await sendWhatsAppText(
-          from,
-          `No entendí el horario 🙏\nResponde con el *número* (1,2,3...) o la *hora* (ej: 10:00).`
-        );
+        await sendWhatsAppText(from, `No entendí el horario 🙏\nResponde con el *número* (1,2,3...) o la *hora* (ej: 10:00).`);
         return res.sendStatus(200);
       }
       session.selectedSlot = picked;
@@ -1185,7 +1249,7 @@ app.post("/webhook", async (req, res) => {
         slot_end: slot.end,
       });
 
-      const prettyService = SERVICES.find((s) => s.key === booked.service)?.title || booked.service;
+      const prettyService = SERVICES.find((s: any) => s.key === booked.service)?.title || booked.service;
 
       await sendWhatsAppText(
         from,
@@ -1205,14 +1269,7 @@ app.post("/webhook", async (req, res) => {
     // -------------------------
     // Services menu ask
     // -------------------------
-    if (
-      tNorm.includes("servicios") ||
-      tNorm.includes("cuales servicios") ||
-      tNorm.includes("qué servicios") ||
-      tNorm.includes("que servicios") ||
-      tNorm.includes("menu") ||
-      tNorm.includes("menú")
-    ) {
+    if (tNorm.includes("servicios") || tNorm.includes("cuales servicios") || tNorm.includes("qué servicios") || tNorm.includes("que servicios") || tNorm.includes("menu") || tNorm.includes("menú")) {
       await sendWhatsAppText(from, servicesEmojiText());
       await sendServicesList(from);
       return res.sendStatus(200);
@@ -1238,7 +1295,6 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // If service detected, try parse date
     if (serviceKey) {
       const range = parseDateRangeFromText(userText);
 
@@ -1247,7 +1303,7 @@ app.post("/webhook", async (req, res) => {
         session.state = "await_day";
         await sendWhatsAppText(
           from,
-          `Perfecto ✅ deseas cita para *${SERVICES.find((s) => s.key === serviceKey)?.title || serviceKey}*.\n\n¿Para qué día?\nEj: "mañana", "viernes", "próximo martes", "la semana que viene" o "14 de junio".`
+          `Perfecto ✅ deseas cita para *${SERVICES.find((s: any) => s.key === serviceKey)?.title || serviceKey}*.\n\n¿Para qué día?\nEj: "mañana", "viernes", "próximo martes", "la semana que viene" o "14 de junio".`
         );
         return res.sendStatus(200);
       }
@@ -1255,10 +1311,7 @@ app.post("/webhook", async (req, res) => {
       const slots = await getAvailableSlotsTool({ service: serviceKey, from: range.from, to: range.to });
 
       if (!slots.length) {
-        await sendWhatsAppText(
-          from,
-          `No veo espacios disponibles para ese rango 🙏\nDime otro día (ej: "próximo viernes") o un mes (ej: "en junio").`
-        );
+        await sendWhatsAppText(from, `No veo espacios disponibles para ese rango 🙏\nDime otro día (ej: "próximo viernes") o un mes (ej: "en junio").`);
         session.pendingService = serviceKey;
         session.state = "await_day";
         return res.sendStatus(200);
@@ -1270,21 +1323,17 @@ app.post("/webhook", async (req, res) => {
       session.state = "await_slot_choice";
 
       const listText = formatSlotsList(serviceKey, slots);
-      await sendWhatsAppText(from, listText);
+      await sendWhatsAppText(from, listText as string);
       return res.sendStatus(200);
     }
 
-    // If they answered a day and we have a pending service
     if (!serviceKey && session.pendingService) {
       const range = parseDateRangeFromText(userText);
       if (range) {
         const slots = await getAvailableSlotsTool({ service: session.pendingService, from: range.from, to: range.to });
 
         if (!slots.length) {
-          await sendWhatsAppText(
-            from,
-            `No veo espacios disponibles para ese rango 🙏\nDime otro día (ej: "próximo viernes") o un mes (ej: "en junio").`
-          );
+          await sendWhatsAppText(from, `No veo espacios disponibles para ese rango 🙏\nDime otro día (ej: "próximo viernes") o un mes (ej: "en junio").`);
           return res.sendStatus(200);
         }
 
@@ -1293,15 +1342,12 @@ app.post("/webhook", async (req, res) => {
         session.state = "await_slot_choice";
 
         const listText = formatSlotsList(session.pendingService, slots);
-        await sendWhatsAppText(from, listText);
+        await sendWhatsAppText(from, listText as string);
         return res.sendStatus(200);
       }
 
       if (session.state === "await_day") {
-        await sendWhatsAppText(
-          from,
-          `Para elegir el día, puedes escribir: "mañana", "viernes", "próximo martes", "la semana que viene", "14 de junio" o "en junio".`
-        );
+        await sendWhatsAppText(from, `Para elegir el día, puedes escribir: "mañana", "viernes", "próximo martes", "la semana que viene", "14 de junio" o "en junio".`);
         return res.sendStatus(200);
       }
     }
@@ -1325,16 +1371,17 @@ app.post("/webhook", async (req, res) => {
 
     await sendWhatsAppText(from, reply);
     return res.sendStatus(200);
-  } catch (e) {
+  } catch (e: any) {
     console.error("Webhook error:", e?.message || e);
     return res.sendStatus(200);
   }
 });
 
-app.get("/", (req, res) => res.send("OK"));
+app.get("/", (_req, res) => res.send("OK"));
 
 // =========================
 // Recordatorios (24h y 2h)
+// ✅ ya quedan reportados al Hub porque usan sendWhatsAppText()
 // =========================
 async function reminderLoop() {
   try {
@@ -1365,12 +1412,7 @@ async function reminderLoop() {
       const start = new Date(startISO);
       const minutesToStart = Math.round((start.getTime() - now.getTime()) / 60000);
 
-      if (
-        REMINDER_24H &&
-        minutesToStart <= 24 * 60 &&
-        minutesToStart >= 24 * 60 - 30 &&
-        priv.reminder24hSent !== "true"
-      ) {
+      if (REMINDER_24H && minutesToStart <= 24 * 60 && minutesToStart >= 24 * 60 - 30 && priv.reminder24hSent !== "true") {
         await sendWhatsAppText(
           phone,
           `Recordatorio 🦷: tienes cita mañana a las ${formatTimeInTZ(startISO, CLINIC_TIMEZONE)} en ${CLINIC_NAME}.\n\nResponde:\n1) Confirmar\n2) Reprogramar\n3) Cancelar`
@@ -1394,7 +1436,7 @@ async function reminderLoop() {
         });
       }
     }
-  } catch (e) {
+  } catch (e: any) {
     console.error("Reminder loop error:", e?.message || e);
   }
 }
@@ -1405,4 +1447,4 @@ setInterval(reminderLoop, 5 * 60 * 1000);
 // =========================
 // Start
 // =========================
-app.listen(PORT, () => console.log(`Bot running on :${PORT}`));
+app.listen(PORT, () => console.log(`✅ ${CLINIC_NAME} bot running on :${PORT}`));
