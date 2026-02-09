@@ -27,6 +27,10 @@ const SLOT_STEP_MIN = parseInt(process.env.SLOT_STEP_MIN || "15", 10);
 const REMINDER_24H = (process.env.REMINDER_24H || "1") === "1";
 const REMINDER_2H = (process.env.REMINDER_2H || "1") === "1";
 
+// ✅ NEW: tu WhatsApp personal para recibir resumen de citas
+// Ej: 1809XXXXXXX o 809XXXXXXX (solo dígitos)
+const PERSONAL_WA_TO = (process.env.PERSONAL_WA_TO || "").trim();
+
 // =========================
 // ✅ BOTHUB (para ver todo en el Hub)
 // =========================
@@ -434,6 +438,37 @@ async function sendWhatsAppText(to, text, reportSource = "BOT") {
     source: reportSource,
     kind: "TEXT",
   });
+}
+
+// ✅ NEW: enviar resumen a tu WhatsApp personal cuando se agenda
+async function notifyPersonalWhatsAppBookingSummary(booking) {
+  try {
+    if (!PERSONAL_WA_TO) return;
+
+    const myTo = String(PERSONAL_WA_TO).replace(/[^\d]/g, "");
+    if (!myTo) return;
+
+    // evitar enviártelo si por error pusiste el mismo número del paciente
+    const patientPhone = String(booking?.phone || "").replace(/[^\d]/g, "");
+    if (patientPhone && myTo === patientPhone) return;
+
+    const prettyService = SERVICES.find((s) => s.key === booking.service)?.title || booking.service;
+
+    const summary =
+      `📌 *Nueva cita agendada*\n\n` +
+      `🏥 Clínica: *${CLINIC_NAME}*\n` +
+      `🦷 Servicio: *${prettyService}*\n` +
+      `👤 Paciente: *${booking.patient_name}*\n` +
+      `📞 Tel: *${patientPhone || "—"}*\n` +
+      `📅 Fecha: *${formatDateInTZ(booking.start, CLINIC_TIMEZONE)}*\n` +
+      `⏰ Hora: *${formatTimeInTZ(booking.start, CLINIC_TIMEZONE)}*\n` +
+      `📍 Dirección: ${CLINIC_ADDRESS || "—"}\n` +
+      `🆔 ID: ${booking.appointment_id || "—"}`;
+
+    await sendWhatsAppText(myTo, summary, "BOT");
+  } catch (e) {
+    console.error("notifyPersonalWhatsAppBookingSummary error:", e?.response?.data || e?.message || e);
+  }
 }
 
 async function sendServicesList(to) {
@@ -1413,6 +1448,9 @@ app.post("/webhook", async (req, res) => {
         from,
         `✅ *Cita reservada*\n\n🦷 Servicio: *${prettyService}*\n👤 Paciente: *${booked.patient_name}*\n📞 Teléfono: *${phoneDigits}*\n📅 Fecha: *${formatDateInTZ(booked.start, CLINIC_TIMEZONE)}*\n⏰ Hora: *${formatTimeInTZ(booked.start, CLINIC_TIMEZONE)}*\n📍 Dirección: ${CLINIC_ADDRESS || "—"}\n\nSi deseas *reprogramar* o *cancelar*, escríbelo aquí.`
       );
+
+      // ✅ NEW: réplica del resumen a tu WhatsApp personal (sin tocar el flujo existente)
+      await notifyPersonalWhatsAppBookingSummary(booked);
 
       session.lastBooking = booked;
       session.state = "post_booking";
