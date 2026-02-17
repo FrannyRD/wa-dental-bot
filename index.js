@@ -25,7 +25,13 @@ const WORK_HOURS = safeJson(process.env.WORK_HOURS_JSON, null) || defaultWorkHou
 const SERVICE_DURATION = safeJson(process.env.SERVICE_DURATION_JSON, null) || defaultServiceDuration();
 const SLOT_STEP_MIN = parseInt(process.env.SLOT_STEP_MIN || "15", 10);
 
-// ✅ NEW: cuántos mostrar en el mensaje (pero guardamos TODOS para que reconozca 3:00 pm aunque no salga en los 8 primeros)
+// ✅ LISTADO SIMPLE: 8am a 5pm cada 1 hora, PERO solo muestra los disponibles
+const HOURLY_LIST_MODE = (process.env.HOURLY_LIST_MODE || "1") === "1";
+const HOURLY_LIST_START = parseInt(process.env.HOURLY_LIST_START || "8", 10); // 8am
+const HOURLY_LIST_END = parseInt(process.env.HOURLY_LIST_END || "17", 10); // 5pm
+const HOURLY_LIST_COUNT = HOURLY_LIST_END - HOURLY_LIST_START + 1; // 10
+
+// ✅ NEW: cuántos mostrar en el mensaje (si NO usas HOURLY_LIST_MODE)
 const DISPLAY_SLOTS_LIMIT = parseInt(process.env.DISPLAY_SLOTS_LIMIT || "16", 10);
 // ✅ NEW: máximo de slots a guardar/retornar para no inflar payload
 const MAX_SLOTS_RETURN = parseInt(process.env.MAX_SLOTS_RETURN || "80", 10);
@@ -73,7 +79,13 @@ function defaultSession() {
   return {
     messages: [],
     state: "idle", // idle | await_slot_choice | await_name | await_phone | post_booking | await_day
-    lastSlots: [], // ✅ aquí guardamos TODOS los slots libres (no solo los 8 primeros)
+
+    // ✅ aquí guardamos TODOS los slots libres (no solo los 8 primeros)
+    lastSlots: [],
+
+    // ✅ NUEVO: lista mostrada (solo disponibles dentro de 8am..5pm cada 1h)
+    lastDisplaySlots: [],
+
     selectedSlot: null,
     pendingService: null,
     pendingRange: null,
@@ -101,8 +113,11 @@ function sanitizeSession(session) {
   session.messages = session.messages.slice(-20);
 
   if (!Array.isArray(session.lastSlots)) session.lastSlots = [];
-  // ✅ antes lo cortabas a 10; ahora lo dejamos más amplio para que pueda elegir 3:00 pm, 4:15 pm, etc.
   session.lastSlots = session.lastSlots.slice(0, MAX_SLOTS_RETURN);
+
+  if (!Array.isArray(session.lastDisplaySlots)) session.lastDisplaySlots = [];
+  // ✅ no inflar (normalmente será <=10, pero lo limitamos igual)
+  session.lastDisplaySlots = session.lastDisplaySlots.slice(0, HOURLY_LIST_COUNT);
 
   if (!session.reschedule || typeof session.reschedule !== "object") {
     session.reschedule = defaultSession().reschedule;
@@ -826,9 +841,7 @@ function buildCandidateSlotsZoned({ service, fromISO, toISO, durationMin }) {
   return slots;
 }
 
-// ✅ FIX: antes devolvías solo 8 (siempre salían de mañana).
-// Ahora devolvemos más (ej 80) y el mensaje muestra solo DISPLAY_SLOTS_LIMIT,
-// pero el usuario puede escribir 3:00 pm y se encontrará si está libre.
+// ✅ FIX: devolvemos más slots (ej 80) y el mensaje muestra solo el listado simple si está activo
 async function getAvailableSlotsTool({ service, from, to }) {
   const calendar = getCalendarClient();
 
@@ -1104,15 +1117,52 @@ function parseDateRangeFromText(userText) {
 }
 
 // =========================
-// Slot formatting
+// Slot formatting (LISTADO SIMPLE 8..5 SOLO DISPONIBLES)
 // =========================
-function formatSlotsList(serviceKey, slots) {
+function buildHourlyDisplaySlotsAvailableOnly(allFreeSlots) {
+  const out = [];
+  for (let h = HOURLY_LIST_START; h <= HOURLY_LIST_END; h++) {
+    const match = allFreeSlots.find((s) => {
+      const parts = getZonedParts(new Date(s.start), CLINIC_TIMEZONE);
+      return parts.hour === h && parts.minute === 0;
+    });
+    if (match) out.push(match);
+  }
+  return out;
+}
+
+function formatSlotsList(serviceKey, slots, session) {
   if (!slots?.length) return null;
   const dateLabel = formatDateInTZ(slots[0].start, CLINIC_TIMEZONE);
   const prettyService = SERVICES.find((s) => s.key === serviceKey)?.title || serviceKey;
 
-  const view = slots.slice(0, Math.max(1, DISPLAY_SLOTS_LIMIT));
+  // ✅ modo simple: solo horas exactas (8..5) que estén disponibles
+  if (HOURLY_LIST_MODE) {
+    const displaySlots = buildHourlyDisplaySlotsAvailableOnly(slots);
+    if (session) session.lastDisplaySlots = displaySlots;
 
+    if (!displaySlots.length) {
+      return (
+        `No veo horarios disponibles entre *8:00 am* y *5:00 pm* para *${prettyService}* el *${dateLabel}* 🙏\n` +
+        `Dime otro día (ej: "viernes") o intenta otro rango.`
+      );
+    }
+
+    const lines = displaySlots.map((s, i) => {
+      const a = formatTimeInTZ(s.start, CLINIC_TIMEZONE);
+      const b = formatTimeInTZ(s.end, CLINIC_TIMEZONE);
+      return `${i + 1}. ${a} - ${b}`;
+    });
+
+    return (
+      `Estos son los horarios disponibles para *${prettyService}* el *${dateLabel}*:\n\n` +
+      `${lines.join("\n")}\n\n` +
+      `Responde con el *número* (1,2,3...) o escribe la *hora* (ej: 10:00 am / 3:00 pm).`
+    );
+  }
+
+  // modo anterior (si lo apagas con env)
+  const view = slots.slice(0, Math.max(1, DISPLAY_SLOTS_LIMIT));
   const lines = view.map((s, i) => {
     const a = formatTimeInTZ(s.start, CLINIC_TIMEZONE);
     const b = formatTimeInTZ(s.end, CLINIC_TIMEZONE);
@@ -1164,12 +1214,22 @@ function parseUserTimeTo24h(userText) {
 function tryPickSlotFromUserText(session, userText) {
   const t = normalizeText(userText);
 
-  // ✅ SOLO si el texto es un número puro, se interpreta como opción (evita "3:00 pm" => opción 3)
+  // ✅ SOLO si el texto es un número puro, se interpreta como opción
   if (/^\d+$/.test(t)) {
     const num = parseInt(t, 10);
-    if (!Number.isNaN(num) && num >= 1 && num <= Math.min(session.lastSlots.length, DISPLAY_SLOTS_LIMIT)) {
-      // el número corresponde a lo que MOSTRAMOS (slice)
-      return session.lastSlots[num - 1];
+    if (!Number.isNaN(num)) {
+      // ✅ modo simple: el número es sobre lo que REALMENTE mostramos (solo disponibles)
+      if (HOURLY_LIST_MODE) {
+        if (num >= 1 && num <= (session.lastDisplaySlots?.length || 0)) {
+          return session.lastDisplaySlots[num - 1] || null;
+        }
+        return null;
+      }
+
+      // modo anterior
+      if (num >= 1 && num <= Math.min(session.lastSlots.length, DISPLAY_SLOTS_LIMIT)) {
+        return session.lastSlots[num - 1];
+      }
     }
   }
 
@@ -1178,6 +1238,20 @@ function tryPickSlotFromUserText(session, userText) {
   if (parsed) {
     const { hh, mm } = parsed;
 
+    // ✅ modo simple: permitimos escoger por hora exacta (hh:00) entre 8..5,
+    // y buscamos en TODOS los slots libres (session.lastSlots)
+    if (HOURLY_LIST_MODE) {
+      if (mm !== 0) return null;
+      if (hh < HOURLY_LIST_START || hh > HOURLY_LIST_END) return null;
+
+      const found = session.lastSlots.find((s) => {
+        const parts = getZonedParts(new Date(s.start), CLINIC_TIMEZONE);
+        return parts.hour === hh && parts.minute === 0;
+      });
+      if (found) return found;
+      return null;
+    }
+
     const found = session.lastSlots.find((s) => {
       const d = new Date(s.start);
       const parts = getZonedParts(d, CLINIC_TIMEZONE);
@@ -1185,8 +1259,6 @@ function tryPickSlotFromUserText(session, userText) {
     });
 
     if (found) return found;
-
-    // si el usuario puso una hora válida pero no está disponible, devolvemos null (lo manejamos con un mensaje más claro)
     return null;
   }
 
@@ -1213,10 +1285,7 @@ function tryPickSlotFromUserText(session, userText) {
 async function callOpenAI({ session, userId, userText, userPhone, extraSystem = "" }) {
   const today = new Date();
   const tzParts = getZonedParts(today, CLINIC_TIMEZONE);
-  const todayStr = `${tzParts.year}-${String(tzParts.month).padStart(2, "0")}-${String(tzParts.day).padStart(
-    2,
-    "0"
-  )}`;
+  const todayStr = `${tzParts.year}-${String(tzParts.month).padStart(2, "0")}-${String(tzParts.day).padStart(2, "0")}`;
 
   const system = {
     role: "system",
@@ -1604,6 +1673,7 @@ app.post("/webhook", async (req, res) => {
 
         session.state = "idle";
         session.lastSlots = [];
+        session.lastDisplaySlots = [];
         session.selectedSlot = null;
         session.pendingService = null;
         session.pendingRange = null;
@@ -1623,6 +1693,7 @@ app.post("/webhook", async (req, res) => {
         session.pendingService = session.reschedule.service || session.pendingService;
         session.state = "await_day";
         session.lastSlots = [];
+        session.lastDisplaySlots = [];
         session.selectedSlot = null;
         session.pendingRange = null;
         session.pendingName = null;
@@ -1674,7 +1745,6 @@ app.post("/webhook", async (req, res) => {
         const parsed = parseUserTimeTo24h(userText);
 
         if (parsed) {
-          // ✅ mensaje claro: sí entendimos la hora, pero no está disponible
           await sendWhatsAppText(
             from,
             `Entendí *${userText}* ✅\nPero ese horario no está disponible.\n\nResponde con el *número* (1,2,3...) o elige una *hora disponible* (ej: 10:00 am / 3:00 pm).`
@@ -1702,7 +1772,7 @@ app.post("/webhook", async (req, res) => {
           service: nextService,
           patient_name: session.reschedule.patient_name,
           phone: session.reschedule.phone || from,
-          wa_id: from, // ✅ NEW: mantenemos wa_id actualizado
+          wa_id: from,
         });
 
         const prettyService = SERVICES.find((s) => s.key === nextService)?.title || nextService;
@@ -1718,6 +1788,7 @@ app.post("/webhook", async (req, res) => {
 
         session.state = "post_booking";
         session.lastSlots = [];
+        session.lastDisplaySlots = [];
         session.selectedSlot = null;
         session.pendingRange = null;
         session.pendingName = null;
@@ -1776,7 +1847,7 @@ app.post("/webhook", async (req, res) => {
         notes: "",
         slot_start: slot.start,
         slot_end: slot.end,
-        wa_id: from, // ✅ NEW: guardamos wa_id real para recordatorios
+        wa_id: from,
       });
 
       const prettyService = SERVICES.find((s) => s.key === booked.service)?.title || booked.service;
@@ -1791,6 +1862,7 @@ app.post("/webhook", async (req, res) => {
       session.lastBooking = booked;
       session.state = "post_booking";
       session.lastSlots = [];
+      session.lastDisplaySlots = [];
       session.selectedSlot = null;
       session.pendingName = null;
       session.pendingRange = null;
@@ -1864,7 +1936,7 @@ app.post("/webhook", async (req, res) => {
       session.lastSlots = slots; // ✅ guardamos TODOS
       session.state = "await_slot_choice";
 
-      const listText = formatSlotsList(serviceKey, slots);
+      const listText = formatSlotsList(serviceKey, slots, session);
       await sendWhatsAppText(from, listText);
       return res.sendStatus(200);
     }
@@ -1886,7 +1958,7 @@ app.post("/webhook", async (req, res) => {
         session.lastSlots = slots; // ✅ guardamos TODOS
         session.state = "await_slot_choice";
 
-        const listText = formatSlotsList(session.pendingService, slots);
+        const listText = formatSlotsList(session.pendingService, slots, session);
         await sendWhatsAppText(from, listText);
         return res.sendStatus(200);
       }
@@ -1968,7 +2040,6 @@ async function reminderLoop() {
       const start = new Date(startISO);
       const minutesToStart = Math.round((start.getTime() - now.getTime()) / 60000);
 
-      // ✅ NEW: ventanas más amplias (para Render Free + cold start) sin spamear por flags
       const in24hWindow = minutesToStart <= 25 * 60 && minutesToStart >= 23 * 60; // 23h - 25h
       const in2hWindow = minutesToStart <= 135 && minutesToStart >= 90; // 1h30 - 2h15
 
@@ -2018,9 +2089,6 @@ app.get("/tick", async (_req, res) => {
   } catch {}
   return res.status(200).send("tick ok");
 });
-
-// (Se mantiene) cada 5 minutos
-// setInterval(reminderLoop, 5 * 60 * 1000);
 
 // =========================
 // Start
