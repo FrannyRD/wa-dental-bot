@@ -1848,7 +1848,7 @@ app.get("/tick", async (_req, res) => {
 });
 
 // (Se mantiene) cada 5 minutos
-setInterval(reminderLoop, 5 * 60 * 1000);
+// setInterval(reminderLoop, 5 * 60 * 1000);
 
 // =========================
 // Start
