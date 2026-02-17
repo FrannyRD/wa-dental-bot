@@ -307,14 +307,15 @@ function safeJson(str, fallback) {
   }
 }
 
+// ✅ CAMBIO: horarios por defecto 8:00 a. m. - 5:00 p. m.
 function defaultWorkHours() {
   return {
-    mon: { start: "09:00", end: "18:00" },
-    tue: { start: "09:00", end: "18:00" },
-    wed: { start: "09:00", end: "18:00" },
-    thu: { start: "09:00", end: "18:00" },
-    fri: { start: "09:00", end: "18:00" },
-    sat: { start: "09:00", end: "13:00" },
+    mon: { start: "08:00", end: "17:00" },
+    tue: { start: "08:00", end: "17:00" },
+    wed: { start: "08:00", end: "17:00" },
+    thu: { start: "08:00", end: "17:00" },
+    fri: { start: "08:00", end: "17:00" },
+    sat: { start: "08:00", end: "13:00" },
     sun: null,
   };
 }
@@ -1107,17 +1108,67 @@ function formatSlotsList(serviceKey, slots) {
 
   return `Estos son los horarios disponibles para *${prettyService}* el *${dateLabel}*:\n\n${lines.join(
     "\n"
-  )}\n\nResponde con el *número* (1,2,3...) o escribe la *hora* (ej: 10:00).`;
+  )}\n\nResponde con el *número* (1,2,3...) o escribe la *hora* (ej: 10:00 am / 3:00 pm).`;
+}
+
+// ✅ NEW: parsear hora del usuario con AM/PM (y evitar que "3:00 pm" se interprete como opción 3)
+function parseUserTimeTo24h(userText) {
+  const raw = String(userText || "").trim().toLowerCase();
+
+  // normaliza variaciones tipo "p. m.", "a. m.", "pm", "am"
+  const compact = raw
+    .replace(/\./g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // acepta: "3", "3pm", "3 pm", "3:00 pm", "15:00", "12:15am"
+  const m = compact.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i);
+  if (!m) return null;
+
+  let hh = parseInt(m[1], 10);
+  const mm = m[2] ? parseInt(m[2], 10) : 0;
+  const mer = m[3] ? String(m[3]).toLowerCase() : "";
+
+  if (Number.isNaN(hh) || Number.isNaN(mm)) return null;
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+
+  // si trae am/pm, lo convertimos a 24h
+  if (mer === "am" || mer === "pm") {
+    if (hh < 1 || hh > 12) return null;
+
+    if (mer === "pm" && hh !== 12) hh += 12;
+    if (mer === "am" && hh === 12) hh = 0;
+  }
+
+  return { hh, mm };
 }
 
 function tryPickSlotFromUserText(session, userText) {
   const t = normalizeText(userText);
 
-  const num = parseInt(t, 10);
-  if (!Number.isNaN(num) && num >= 1 && num <= session.lastSlots.length) {
-    return session.lastSlots[num - 1];
+  // ✅ FIX: SOLO si el texto es un número puro, se interpreta como opción (evita "3:00 pm" => opción 3)
+  if (/^\d+$/.test(t)) {
+    const num = parseInt(t, 10);
+    if (!Number.isNaN(num) && num >= 1 && num <= session.lastSlots.length) {
+      return session.lastSlots[num - 1];
+    }
   }
 
+  // ✅ Hora con AM/PM o 24h
+  const parsed = parseUserTimeTo24h(userText);
+  if (parsed) {
+    const { hh, mm } = parsed;
+
+    const found = session.lastSlots.find((s) => {
+      const d = new Date(s.start);
+      const parts = getZonedParts(d, CLINIC_TIMEZONE);
+      return parts.hour === hh && parts.minute === mm;
+    });
+
+    if (found) return found;
+  }
+
+  // fallback antiguo: "10:00" / "10"
   const m = t.match(/^(\d{1,2})(?::(\d{2}))?$/);
   if (m) {
     const hh = parseInt(m[1], 10);
@@ -1597,7 +1648,7 @@ app.post("/webhook", async (req, res) => {
       if (!picked) {
         await sendWhatsAppText(
           from,
-          `No entendí el horario 🙏\nResponde con el *número* (1,2,3...) o la *hora* (ej: 10:00).`
+          `No entendí el horario 🙏\nResponde con el *número* (1,2,3...) o la *hora* (ej: 10:00 am / 3:00 pm).`
         );
         return res.sendStatus(200);
       }
@@ -1834,7 +1885,7 @@ app.post("/webhook", async (req, res) => {
     await sendWhatsAppText(from, reply);
     return res.sendStatus(200);
   } catch (e) {
-    console.error("Webhook error:", e?.message || e);
+    console.error("Webhook error:", e?.response?.data || e?.message || e);
     return res.sendStatus(200);
   } finally {
     try {
@@ -1920,7 +1971,7 @@ async function reminderLoop() {
       }
     }
   } catch (e) {
-    console.error("Reminder loop error:", e?.message || e);
+    console.error("Reminder loop error:", e?.response?.data || e?.message || e);
   }
 }
 
