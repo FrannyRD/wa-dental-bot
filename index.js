@@ -45,7 +45,7 @@ const REDIS_URL_RAW = (process.env.REDIS_URL || "").trim();
 const SESSION_TTL_SEC = parseInt(process.env.SESSION_TTL_SEC || String(60 * 60 * 24 * 14), 10); // 14 días
 const SESSION_PREFIX = process.env.SESSION_PREFIX || "tekko:dental:sess:";
 
-function normalizeRedisUrl(url: string) {
+function normalizeRedisUrl(url) {
   const u = String(url || "").trim();
   if (!u) return "";
   if (u.startsWith("redis://")) return "rediss://" + u.slice("redis://".length);
@@ -53,17 +53,16 @@ function normalizeRedisUrl(url: string) {
 }
 
 const redisUrl = normalizeRedisUrl(REDIS_URL_RAW);
-const redis =
-  redisUrl
-    ? new Redis(redisUrl, {
-        tls: redisUrl.startsWith("rediss://") ? { rejectUnauthorized: false } : undefined,
-        maxRetriesPerRequest: 2,
-        enableReadyCheck: true,
-      })
-    : null;
+const redis = redisUrl
+  ? new Redis(redisUrl, {
+      tls: redisUrl.startsWith("rediss://") ? { rejectUnauthorized: false } : undefined,
+      maxRetriesPerRequest: 2,
+      enableReadyCheck: true,
+    })
+  : null;
 
 // fallback in-memory si no configuras REDIS_URL
-const sessions = new Map<string, any>();
+const sessions = new Map();
 
 function defaultSession() {
   return {
@@ -91,7 +90,7 @@ function defaultSession() {
   };
 }
 
-function sanitizeSession(session: any) {
+function sanitizeSession(session) {
   if (!session || typeof session !== "object") return defaultSession();
   if (!Array.isArray(session.messages)) session.messages = [];
   session.messages = session.messages.slice(-20);
@@ -109,14 +108,13 @@ function sanitizeSession(session: any) {
     if (typeof session.reschedule.service !== "string") session.reschedule.service = "";
   }
 
-  // compat de campos
   if (typeof session.state !== "string") session.state = "idle";
   if (typeof session.greeted !== "boolean") session.greeted = false;
 
   return session;
 }
 
-async function getSession(userId: string) {
+async function getSession(userId) {
   if (!userId) return sanitizeSession(defaultSession());
 
   if (!redis) {
@@ -130,7 +128,7 @@ async function getSession(userId: string) {
   return sanitizeSession(s);
 }
 
-async function saveSession(userId: string, session: any) {
+async function saveSession(userId, session) {
   if (!userId || !session) return;
 
   session = sanitizeSession(session);
@@ -147,23 +145,23 @@ async function saveSession(userId: string, session: any) {
 // =====================================================
 // Stable stringify (para firma HMAC consistente)
 // =====================================================
-function stableStringify(obj: any) {
+function stableStringify(obj) {
   if (obj === null || typeof obj !== "object") return JSON.stringify(obj);
   if (Array.isArray(obj)) return `[${obj.map(stableStringify).join(",")}]`;
   const keys = Object.keys(obj).sort();
   return `{${keys.map((k) => JSON.stringify(k) + ":" + stableStringify(obj[k])).join(",")}}`;
 }
 
-function bothubHmacStable(payload: any, secret: string) {
+function bothubHmacStable(payload, secret) {
   const raw = stableStringify(payload);
   return crypto.createHmac("sha256", secret).update(raw).digest("hex");
 }
 
-function bothubHmacJson(payload: any, secret: string) {
+function bothubHmacJson(payload, secret) {
   return crypto.createHmac("sha256", secret).update(JSON.stringify(payload)).digest("hex");
 }
 
-function getHubSignature(req: any) {
+function getHubSignature(req) {
   const h =
     req.get("X-HUB-SIGNATURE") ||
     req.get("x-hub-signature") ||
@@ -178,14 +176,14 @@ function getHubSignature(req: any) {
   return sig.startsWith("sha256=") ? sig.slice("sha256=".length) : sig;
 }
 
-function timingSafeEqualHex(aHex: string, bHex: string) {
+function timingSafeEqualHex(aHex, bHex) {
   const a = Buffer.from(String(aHex || ""), "utf8");
   const b = Buffer.from(String(bHex || ""), "utf8");
   if (!a.length || a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
 }
 
-function verifyHubSignature(reqBody: any, signatureHex: string, secret: string) {
+function verifyHubSignature(reqBody, signatureHex, secret) {
   if (!signatureHex || !secret) return false;
 
   const expectedStable = bothubHmacStable(reqBody, secret);
@@ -197,7 +195,7 @@ function verifyHubSignature(reqBody: any, signatureHex: string, secret: string) 
   return false;
 }
 
-async function bothubReportMessage(payload: any) {
+async function bothubReportMessage(payload) {
   if (!BOTHUB_WEBHOOK_URL || !BOTHUB_WEBHOOK_SECRET) return;
 
   try {
@@ -209,13 +207,13 @@ async function bothubReportMessage(payload: any) {
       },
       timeout: BOTHUB_TIMEOUT_MS,
     });
-  } catch (e: any) {
+  } catch (e) {
     console.error("Bothub report failed:", e?.response?.data || e?.message || e);
   }
 }
 
 // ✅ Meta para audio/ubicación/attachments (para que en Hub se vea TODO)
-function extractInboundMeta(msg: any) {
+function extractInboundMeta(msg) {
   if (!msg) return {};
 
   if (msg?.type === "audio") {
@@ -278,7 +276,7 @@ function extractInboundMeta(msg: any) {
 const app = express();
 app.use(
   express.json({
-    verify: (req: any, _res, buf) => {
+    verify: (req, _res, buf) => {
       req.rawBody = buf;
     },
   })
@@ -296,12 +294,12 @@ const SERVICES = [
   { key: "odontopediatria", title: "Odontopediatría", id: "svc_odontopediatria" },
 ];
 
-const SERVICE_ID_TO_KEY: Record<string, string> = Object.fromEntries(SERVICES.map((s) => [s.id, s.key]));
+const SERVICE_ID_TO_KEY = Object.fromEntries(SERVICES.map((s) => [s.id, s.key]));
 
 // =========================
 // Helpers
 // =========================
-function safeJson(str: any, fallback: any) {
+function safeJson(str, fallback) {
   try {
     return JSON.parse(str);
   } catch {
@@ -333,7 +331,7 @@ function defaultServiceDuration() {
   };
 }
 
-function verifyMetaSignature(req: any) {
+function verifyMetaSignature(req) {
   if (!META_APP_SECRET) return true;
   const signature = req.get("X-Hub-Signature-256");
   if (!signature) return false;
@@ -352,11 +350,11 @@ function verifyMetaSignature(req: any) {
   }
 }
 
-function addMinutes(date: Date, minutes: number) {
+function addMinutes(date, minutes) {
   return new Date(date.getTime() + minutes * 60000);
 }
 
-function normalizeText(t: string) {
+function normalizeText(t) {
   return (t || "")
     .toLowerCase()
     .normalize("NFD")
@@ -365,13 +363,11 @@ function normalizeText(t: string) {
     .trim();
 }
 
-function weekdayKeyFromISOWeekday(isoWeekday: number) {
-  // 1..7 => mon..sun
-  return ["", "mon", "tue", "wed", "thu", "fri", "sat", "sun"][isoWeekday] as any;
+function weekdayKeyFromISOWeekday(isoWeekday) {
+  return ["", "mon", "tue", "wed", "thu", "fri", "sat", "sun"][isoWeekday];
 }
 
-// NEW: detectar saludo para evitar doble respuesta
-function isGreeting(textNorm: string) {
+function isGreeting(textNorm) {
   const t = textNorm || "";
   const greetings = [
     "hola",
@@ -387,8 +383,7 @@ function isGreeting(textNorm: string) {
     "hi",
   ];
   const isOnlyGreeting =
-    greetings.some((g) => t === g || t.startsWith(g + " ")) ||
-    /^(hola+|buenas+)\b/.test(t);
+    greetings.some((g) => t === g || t.startsWith(g + " ")) || /^(hola+|buenas+)\b/.test(t);
 
   const hasBookingIntent =
     t.includes("cita") ||
@@ -402,7 +397,6 @@ function isGreeting(textNorm: string) {
   return isOnlyGreeting && !hasBookingIntent && t.length <= 40;
 }
 
-// ✅ NEW: mensaje corto para 2do saludo (sin menú)
 function quickHelpText() {
   return (
     `¡Hola! 😊\n` +
@@ -411,43 +405,43 @@ function quickHelpText() {
   );
 }
 
-function isThanks(textNorm: string) {
+function isThanks(textNorm) {
   return ["gracias", "ok", "okay", "listo", "perfecto", "dale", "bien", "genial"].some(
     (k) => textNorm === k || textNorm.includes(k)
   );
 }
 
-function isChoice(textNorm: string, n: number) {
+function isChoice(textNorm, n) {
   const t = (textNorm || "").trim();
   return t === String(n) || t === `${n}.` || t.startsWith(`${n} `);
 }
 
-function looksLikeConfirm(textNorm: string) {
+function looksLikeConfirm(textNorm) {
   return ["confirmar", "confirmo", "confirmada", "confirmado", "confirmacion", "confirmación"].some((k) =>
     (textNorm || "").includes(k)
   );
 }
 
-function looksLikeCancel(textNorm: string) {
+function looksLikeCancel(textNorm) {
   return ["cancelar", "cancela", "anular", "anula", "no puedo", "ya no", "cancelacion", "cancelación"].some((k) =>
     (textNorm || "").includes(k)
   );
 }
 
-function looksLikeReschedule(textNorm: string) {
+function looksLikeReschedule(textNorm) {
   return ["reprogramar", "reprograma", "cambiar", "cambio", "mover", "posponer", "otro horario"].some((k) =>
     (textNorm || "").includes(k)
   );
 }
 
-function looksLikeNewAppointment(textNorm: string) {
+function looksLikeNewAppointment(textNorm) {
   return ["nueva cita", "otra cita", "agendar", "reservar", "cita nueva", "quiero cita"].some((k) =>
     (textNorm || "").includes(k)
   );
 }
 
 // ---- Timezone utilities ----
-function getZonedParts(date: Date, timeZone: string) {
+function getZonedParts(date, timeZone) {
   const fmt = new Intl.DateTimeFormat("en-CA", {
     timeZone,
     year: "numeric",
@@ -459,7 +453,7 @@ function getZonedParts(date: Date, timeZone: string) {
     hour12: false,
   });
   const parts = fmt.formatToParts(date);
-  const obj: any = {};
+  const obj = {};
   for (const p of parts) obj[p.type] = p.value;
   return {
     year: parseInt(obj.year, 10),
@@ -471,22 +465,19 @@ function getZonedParts(date: Date, timeZone: string) {
   };
 }
 
-function getOffsetMinutes(date: Date, timeZone: string) {
+function getOffsetMinutes(date, timeZone) {
   const p = getZonedParts(date, timeZone);
   const asUTC = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
   return (asUTC - date.getTime()) / 60000;
 }
 
-function zonedTimeToUtc(
-  { year, month, day, hour, minute, second = 0 }: any,
-  timeZone: string
-) {
+function zonedTimeToUtc({ year, month, day, hour, minute, second = 0 }, timeZone) {
   const guess = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
   const offsetMin = getOffsetMinutes(guess, timeZone);
   return new Date(Date.UTC(year, month - 1, day, hour, minute, second) - offsetMin * 60000);
 }
 
-function formatTimeInTZ(iso: string, timeZone: string) {
+function formatTimeInTZ(iso, timeZone) {
   const d = new Date(iso);
   return new Intl.DateTimeFormat("es-DO", {
     timeZone,
@@ -496,7 +487,7 @@ function formatTimeInTZ(iso: string, timeZone: string) {
   }).format(d);
 }
 
-function formatDateInTZ(iso: string, timeZone: string) {
+function formatDateInTZ(iso, timeZone) {
   const d = new Date(iso);
   return new Intl.DateTimeFormat("es-DO", {
     timeZone,
@@ -510,16 +501,11 @@ function formatDateInTZ(iso: string, timeZone: string) {
 // =========================
 // WhatsApp send text / interactive list
 // =========================
-async function sendWhatsAppText(to: string, text: string, reportSource = "BOT") {
+async function sendWhatsAppText(to, text, reportSource = "BOT") {
   const url = `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`;
   await axios.post(
     url,
-    {
-      messaging_product: "whatsapp",
-      to,
-      type: "text",
-      text: { body: text },
-    },
+    { messaging_product: "whatsapp", to, type: "text", text: { body: text } },
     { headers: { Authorization: `Bearer ${WA_TOKEN}` } }
   );
 
@@ -532,8 +518,7 @@ async function sendWhatsAppText(to: string, text: string, reportSource = "BOT") 
   });
 }
 
-// ✅ NEW: enviar resumen a tu WhatsApp personal cuando se agenda
-async function notifyPersonalWhatsAppBookingSummary(booking: any) {
+async function notifyPersonalWhatsAppBookingSummary(booking) {
   try {
     if (!PERSONAL_WA_TO) return;
 
@@ -557,19 +542,15 @@ async function notifyPersonalWhatsAppBookingSummary(booking: any) {
       `🆔 ID: ${booking.appointment_id || "—"}`;
 
     await sendWhatsAppText(myTo, summary, "BOT");
-  } catch (e: any) {
+  } catch (e) {
     console.error("notifyPersonalWhatsAppBookingSummary error:", e?.response?.data || e?.message || e);
   }
 }
 
-async function sendServicesList(to: string) {
+async function sendServicesList(to) {
   const url = `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`;
 
-  const rows = SERVICES.map((s) => ({
-    id: s.id,
-    title: s.title,
-    description: "",
-  }));
+  const rows = SERVICES.map((s) => ({ id: s.id, title: s.title, description: "" }));
 
   await axios.post(
     url,
@@ -582,10 +563,7 @@ async function sendServicesList(to: string) {
         header: { type: "text", text: "Nuestros servicios" },
         body: { text: "Selecciona un servicio para agendar tu cita 👇\n(O si prefieres, escríbelo)" },
         footer: { text: CLINIC_NAME },
-        action: {
-          button: "Ver servicios",
-          sections: [{ title: "Servicios", rows }],
-        },
+        action: { button: "Ver servicios", sections: [{ title: "Servicios", rows }] },
       },
     },
     { headers: { Authorization: `Bearer ${WA_TOKEN}` } }
@@ -605,7 +583,6 @@ async function sendServicesList(to: string) {
   });
 }
 
-// NEW: Primer mensaje con opción A/B
 function servicesEmojiText() {
   return (
     `👋 ¡Hola! Soy el asistente de *${CLINIC_NAME}*.\n\n` +
@@ -640,9 +617,9 @@ function getCalendarClient() {
 }
 
 // =========================
-// ✅ Encontrar cita por teléfono (robusto si sesión se pierde)
+// ✅ Encontrar cita por teléfono
 // =========================
-async function findUpcomingAppointmentByPhone(phone: string, windowDays = 120) {
+async function findUpcomingAppointmentByPhone(phone, windowDays = 120) {
   try {
     const phoneDigits = String(phone || "").replace(/[^\d]/g, "");
     if (!phoneDigits) return null;
@@ -686,13 +663,13 @@ async function findUpcomingAppointmentByPhone(phone: string, windowDays = 120) {
     }
 
     return null;
-  } catch (e: any) {
+  } catch (e) {
     console.error("findUpcomingAppointmentByPhone error:", e?.response?.data || e?.message || e);
     return null;
   }
 }
 
-function inferServiceFromSummary(summary: string) {
+function inferServiceFromSummary(summary) {
   const s = normalizeText(summary || "");
   if (s.includes("ortodon")) return "ortodoncia";
   if (s.includes("implan")) return "implantes";
@@ -704,9 +681,9 @@ function inferServiceFromSummary(summary: string) {
 }
 
 // =========================
-// Calendar: FreeBusy => generate slots (timezone-safe)
+// Calendar: FreeBusy => generate slots
 // =========================
-async function getBusyRanges(calendar: any, timeMinISO: string, timeMaxISO: string) {
+async function getBusyRanges(calendar, timeMinISO, timeMaxISO) {
   const fb = await calendar.freebusy.query({
     requestBody: {
       timeMin: timeMinISO,
@@ -717,17 +694,14 @@ async function getBusyRanges(calendar: any, timeMinISO: string, timeMaxISO: stri
   });
 
   const busy = fb.data.calendars?.[GOOGLE_CALENDAR_ID]?.busy || [];
-  return busy.map((b: any) => ({
-    start: new Date(b.start),
-    end: new Date(b.end),
-  }));
+  return busy.map((b) => ({ start: new Date(b.start), end: new Date(b.end) }));
 }
 
-function overlaps(aStart: Date, aEnd: Date, bStart: Date, bEnd: Date) {
+function overlaps(aStart, aEnd, bStart, bEnd) {
   return aStart < bEnd && aEnd > bStart;
 }
 
-function buildCandidateSlotsZoned({ service, fromISO, toISO, durationMin }: any) {
+function buildCandidateSlotsZoned({ service, fromISO, toISO, durationMin }) {
   const from = new Date(fromISO);
   const to = new Date(toISO);
 
@@ -743,7 +717,7 @@ function buildCandidateSlotsZoned({ service, fromISO, toISO, durationMin }: any)
     CLINIC_TIMEZONE
   );
 
-  const slots: any[] = [];
+  const slots = [];
 
   while (curUTC <= endUTC) {
     const curLocal = getZonedParts(curUTC, CLINIC_TIMEZONE);
@@ -751,11 +725,11 @@ function buildCandidateSlotsZoned({ service, fromISO, toISO, durationMin }: any)
     const js = new Date(Date.UTC(curLocal.year, curLocal.month - 1, curLocal.day, 12, 0, 0));
     const isoWeekday = ((js.getUTCDay() + 6) % 7) + 1;
     const key = weekdayKeyFromISOWeekday(isoWeekday);
-    const wh = (WORK_HOURS as any)[key];
+    const wh = WORK_HOURS[key];
 
     if (wh) {
-      const [sh, sm] = wh.start.split(":").map((n: string) => parseInt(n, 10));
-      const [eh, em] = wh.end.split(":").map((n: string) => parseInt(n, 10));
+      const [sh, sm] = wh.start.split(":").map((n) => parseInt(n, 10));
+      const [eh, em] = wh.end.split(":").map((n) => parseInt(n, 10));
 
       let cursorMin = sh * 60 + sm;
       const endMin = eh * 60 + em;
@@ -795,17 +769,17 @@ function buildCandidateSlotsZoned({ service, fromISO, toISO, durationMin }: any)
   return slots;
 }
 
-async function getAvailableSlotsTool({ service, from, to }: any) {
+async function getAvailableSlotsTool({ service, from, to }) {
   const calendar = getCalendarClient();
 
-  const durationMin = (SERVICE_DURATION as any)[service] || (SERVICE_DURATION as any)["otro"] || 30;
+  const durationMin = SERVICE_DURATION[service] || SERVICE_DURATION["otro"] || 30;
   const busyRanges = await getBusyRanges(calendar, from, to);
   const candidates = buildCandidateSlotsZoned({ service, fromISO: from, toISO: to, durationMin });
 
-  const free = candidates.filter((c: any) => {
+  const free = candidates.filter((c) => {
     const cs = new Date(c.start);
     const ce = new Date(c.end);
-    return !busyRanges.some((b: any) => overlaps(cs, ce, b.start, b.end));
+    return !busyRanges.some((b) => overlaps(cs, ce, b.start, b.end));
   });
 
   return free.slice(0, 8);
@@ -814,9 +788,8 @@ async function getAvailableSlotsTool({ service, from, to }: any) {
 // =========================
 // Calendar: book / reschedule / cancel
 // =========================
-async function bookAppointmentTool({ patient_name, phone, slot_id, service, notes, slot_start, slot_end }: any) {
+async function bookAppointmentTool({ patient_name, phone, slot_id, service, notes, slot_start, slot_end }) {
   const calendar = getCalendarClient();
-
   if (!slot_start || !slot_end) throw new Error("Missing slot_start/slot_end");
 
   const event = await calendar.events.insert({
@@ -840,18 +813,10 @@ async function bookAppointmentTool({ patient_name, phone, slot_id, service, note
     },
   });
 
-  return {
-    appointment_id: event.data.id,
-    start: slot_start,
-    end: slot_end,
-    service,
-    patient_name,
-    phone,
-  };
+  return { appointment_id: event.data.id, start: slot_start, end: slot_end, service, patient_name, phone };
 }
 
-// ✅ Mejorado: permite opcionalmente actualizar service/patient_name en reprogramación
-async function rescheduleAppointmentTool({ appointment_id, new_slot_id, new_start, new_end, service, patient_name, phone }: any) {
+async function rescheduleAppointmentTool({ appointment_id, new_slot_id, new_start, new_end, service, patient_name, phone }) {
   const calendar = getCalendarClient();
   if (!new_start || !new_end) throw new Error("Missing new_start/new_end");
 
@@ -867,14 +832,14 @@ async function rescheduleAppointmentTool({ appointment_id, new_slot_id, new_star
     slot_id: new_slot_id,
     reminder24hSent: "false",
     reminder2hSent: "false",
-  } as any;
+  };
 
   if (nextService) nextPriv.service = nextService;
   if (nextName) nextPriv.patient_name = nextName;
   if (nextPhone) nextPriv.wa_phone = nextPhone;
 
   const nextSummary =
-    nextService && nextName ? `Cita - ${nextService} - ${nextName}` : (current.data.summary || "Cita");
+    nextService && nextName ? `Cita - ${nextService} - ${nextName}` : current.data.summary || "Cita";
 
   const updated = await calendar.events.patch({
     calendarId: GOOGLE_CALENDAR_ID,
@@ -890,7 +855,7 @@ async function rescheduleAppointmentTool({ appointment_id, new_slot_id, new_star
   return { ok: true, appointment_id: updated.data.id, new_start, new_end };
 }
 
-async function cancelAppointmentTool({ appointment_id, reason }: any) {
+async function cancelAppointmentTool({ appointment_id, reason }) {
   const calendar = getCalendarClient();
 
   const event = await calendar.events.get({ calendarId: GOOGLE_CALENDAR_ID, eventId: appointment_id });
@@ -903,10 +868,7 @@ async function cancelAppointmentTool({ appointment_id, reason }: any) {
       summary: `CANCELADA - ${summary}`,
       description: (event.data.description || "") + `\n\nCancelación: ${reason || ""}`,
       extendedProperties: {
-        private: {
-          ...(event.data.extendedProperties?.private || {}),
-          status: "cancelled",
-        },
+        private: { ...(event.data.extendedProperties?.private || {}), status: "cancelled" },
       },
     },
   });
@@ -914,14 +876,14 @@ async function cancelAppointmentTool({ appointment_id, reason }: any) {
   return { ok: true, appointment_id };
 }
 
-async function handoffToHumanTool({ summary }: any) {
+async function handoffToHumanTool({ summary }) {
   return { ok: true, routed: true, summary };
 }
 
 // =========================
-// Date parsing (improved)
+// Date parsing
 // =========================
-const DOW: Record<string, number> = {
+const DOW = {
   lunes: 1,
   martes: 2,
   miercoles: 3,
@@ -933,7 +895,7 @@ const DOW: Record<string, number> = {
   domingo: 7,
 };
 
-const MONTHS: Record<string, number> = {
+const MONTHS = {
   enero: 1,
   febrero: 2,
   marzo: 3,
@@ -949,12 +911,12 @@ const MONTHS: Record<string, number> = {
   diciembre: 12,
 };
 
-function startOfLocalDayUTC(date: Date, tz: string) {
+function startOfLocalDayUTC(date, tz) {
   const p = getZonedParts(date, tz);
   return zonedTimeToUtc({ year: p.year, month: p.month, day: p.day, hour: 0, minute: 0 }, tz);
 }
 
-function addLocalDaysUTC(dateUTC: Date, days: number, tz: string) {
+function addLocalDaysUTC(dateUTC, days, tz) {
   const p = getZonedParts(dateUTC, tz);
   const base = new Date(Date.UTC(p.year, p.month - 1, p.day, 12, 0, 0));
   base.setUTCDate(base.getUTCDate() + days);
@@ -964,7 +926,7 @@ function addLocalDaysUTC(dateUTC: Date, days: number, tz: string) {
   );
 }
 
-function nextWeekdayFromTodayUTC(targetIsoDow: number, tz: string, isNext = false) {
+function nextWeekdayFromTodayUTC(targetIsoDow, tz, isNext = false) {
   const now = new Date();
   const todayLocal = startOfLocalDayUTC(now, tz);
 
@@ -980,14 +942,14 @@ function nextWeekdayFromTodayUTC(targetIsoDow: number, tz: string, isNext = fals
   return addLocalDaysUTC(todayLocal, diff, tz);
 }
 
-function rangeForWholeMonth(year: number, month: number) {
+function rangeForWholeMonth(year, month) {
   const from = zonedTimeToUtc({ year, month, day: 1, hour: 0, minute: 0 }, CLINIC_TIMEZONE);
   const toMonth = month === 12 ? { year: year + 1, month: 1 } : { year, month: month + 1 };
   const to = zonedTimeToUtc({ year: toMonth.year, month: toMonth.month, day: 1, hour: 0, minute: 0 }, CLINIC_TIMEZONE);
   return { from: from.toISOString(), to: to.toISOString() };
 }
 
-function parseDateRangeFromText(userText: string) {
+function parseDateRangeFromText(userText) {
   const t = normalizeText(userText);
 
   if (t.includes("hoy")) {
@@ -1058,7 +1020,7 @@ function parseDateRangeFromText(userText: string) {
 // =========================
 // Slot formatting
 // =========================
-function formatSlotsList(serviceKey: string, slots: any[]) {
+function formatSlotsList(serviceKey, slots) {
   if (!slots?.length) return null;
   const dateLabel = formatDateInTZ(slots[0].start, CLINIC_TIMEZONE);
   const prettyService = SERVICES.find((s) => s.key === serviceKey)?.title || serviceKey;
@@ -1074,7 +1036,7 @@ function formatSlotsList(serviceKey: string, slots: any[]) {
   )}\n\nResponde con el *número* (1,2,3...) o escribe la *hora* (ej: 10:00).`;
 }
 
-function tryPickSlotFromUserText(session: any, userText: string) {
+function tryPickSlotFromUserText(session, userText) {
   const t = normalizeText(userText);
 
   const num = parseInt(t, 10);
@@ -1087,7 +1049,7 @@ function tryPickSlotFromUserText(session: any, userText: string) {
     const hh = parseInt(m[1], 10);
     const mm = m[2] ? parseInt(m[2], 10) : 0;
 
-    const found = session.lastSlots.find((s: any) => {
+    const found = session.lastSlots.find((s) => {
       const d = new Date(s.start);
       const parts = getZonedParts(d, CLINIC_TIMEZONE);
       return parts.hour === hh && parts.minute === mm;
@@ -1101,7 +1063,7 @@ function tryPickSlotFromUserText(session: any, userText: string) {
 // =========================
 // OpenAI: tool calling (kept)
 // =========================
-async function callOpenAI({ session, userId, userText, userPhone, extraSystem = "" }: any) {
+async function callOpenAI({ session, userId, userText, userPhone, extraSystem = "" }) {
   const today = new Date();
   const tzParts = getZonedParts(today, CLINIC_TIMEZONE);
   const todayStr = `${tzParts.year}-${String(tzParts.month).padStart(2, "0")}-${String(tzParts.day).padStart(2, "0")}`;
@@ -1210,9 +1172,7 @@ Tel usuario: ${userPhone}.
         description: "Deriva a humano si urgencia o caso especial.",
         parameters: {
           type: "object",
-          properties: {
-            summary: { type: "string" },
-          },
+          properties: { summary: { type: "string" } },
           required: ["summary"],
         },
       },
@@ -1234,7 +1194,7 @@ Tel usuario: ${userPhone}.
   const msg = resp.data.choices?.[0]?.message;
 
   if (msg?.tool_calls?.length) {
-    const toolResults: any[] = [];
+    const toolResults = [];
     for (const tc of msg.tool_calls) {
       const name = tc.function.name;
       const args = JSON.parse(tc.function.arguments || "{}");
@@ -1267,11 +1227,7 @@ Tel usuario: ${userPhone}.
 
     const resp2 = await axios.post(
       "https://api.openai.com/v1/chat/completions",
-      {
-        model: "gpt-4.1-mini",
-        messages: [...messages, msg, ...toolResults],
-        temperature: 0.2,
-      },
+      { model: "gpt-4.1-mini", messages: [...messages, msg, ...toolResults], temperature: 0.2 },
       { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
     );
 
@@ -1281,8 +1237,7 @@ Tel usuario: ${userPhone}.
   }
 
   const text =
-    msg?.content?.trim() ||
-    "Hola 👋 ¿Deseas agendar una cita? Escribe el servicio o te muestro el menú.";
+    msg?.content?.trim() || "Hola 👋 ¿Deseas agendar una cita? Escribe el servicio o te muestro el menú.";
   session.messages.push({ role: "assistant", content: text });
   return text;
 }
@@ -1298,7 +1253,7 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-function extractIncomingText(msg: any) {
+function extractIncomingText(msg) {
   if (!msg) return "";
 
   if (msg?.text?.body) return msg.text.body;
@@ -1331,7 +1286,7 @@ function extractIncomingText(msg: any) {
   return `[${(msg?.type || "UNKNOWN").toUpperCase()}]`;
 }
 
-function detectServiceKeyFromUser(text: string) {
+function detectServiceKeyFromUser(text) {
   const t = normalizeText(text);
 
   if (SERVICE_ID_TO_KEY[text]) return SERVICE_ID_TO_KEY[text];
@@ -1379,15 +1334,15 @@ app.post("/agent_message", async (req, res) => {
 
     await sendWhatsAppText(String(waTo), String(text), "AGENT");
     return res.json({ ok: true });
-  } catch (e: any) {
+  } catch (e) {
     console.error("agent_message error:", e?.response?.data || e?.message || e);
     return res.status(500).json({ error: "Internal error" });
   }
 });
 
-app.post("/webhook", async (req: any, res) => {
+app.post("/webhook", async (req, res) => {
   let from = "";
-  let session: any = null;
+  let session = null;
 
   try {
     if (!verifyMetaSignature(req)) return res.sendStatus(403);
@@ -1429,7 +1384,7 @@ app.post("/webhook", async (req: any, res) => {
     });
 
     // =========================
-    // Si usuario pide cancelar/reprogramar y NO hay lastBooking => buscar en Calendar
+    // Si usuario pide cancelar/reprogramar/confirmar y NO hay lastBooking => buscar en Calendar
     // =========================
     const wantsCancel = looksLikeCancel(tNorm) || isChoice(tNorm, 3);
     const wantsReschedule = looksLikeReschedule(tNorm) || isChoice(tNorm, 2);
@@ -1477,7 +1432,6 @@ app.post("/webhook", async (req: any, res) => {
     // POST-BOOKING STATE
     // =========================
     if (session.state === "post_booking" && session.lastBooking) {
-      // ✅ Confirmar por "1" o "confirmar"
       if (wantsConfirm) {
         const b = session.lastBooking;
         await sendWhatsAppText(
@@ -1487,7 +1441,7 @@ app.post("/webhook", async (req: any, res) => {
           }\n📅 Fecha: ${formatDateInTZ(b.start, CLINIC_TIMEZONE)}\n⏰ Hora: ${formatTimeInTZ(
             b.start,
             CLINIC_TIMEZONE
-          )}\n\nSi necesitas *reprogramar* o *cancelar*, responde:\n2) Reprogramar\n3) Cancelar`
+          )}\n\nResponde:\n2) Reprogramar\n3) Cancelar`
         );
         return res.sendStatus(200);
       }
@@ -1499,7 +1453,6 @@ app.post("/webhook", async (req: any, res) => {
           `✅ Listo. Tu cita fue cancelada.\n\nSi deseas agendar una nueva, escribe "Nueva cita" o dime el servicio.`
         );
 
-        // reset
         session.state = "idle";
         session.lastSlots = [];
         session.selectedSlot = null;
@@ -1512,14 +1465,12 @@ app.post("/webhook", async (req: any, res) => {
       }
 
       if (wantsReschedule) {
-        // activar modo reprogramación
         session.reschedule.active = true;
         session.reschedule.appointment_id = session.lastBooking.appointment_id;
         session.reschedule.phone = session.lastBooking.phone || String(from).replace(/[^\d]/g, "");
         session.reschedule.patient_name = session.lastBooking.patient_name || "";
         session.reschedule.service = session.lastBooking.service || "";
 
-        // mantener el mismo servicio por defecto
         session.pendingService = session.reschedule.service || session.pendingService;
         session.state = "await_day";
         session.lastSlots = [];
@@ -1577,7 +1528,7 @@ app.post("/webhook", async (req: any, res) => {
         return res.sendStatus(200);
       }
 
-      // ✅ Si estamos reprogramando, NO pedimos nombre/teléfono, reprogramamos directo
+      // ✅ Reprogramación: reprograma directo
       if (session.reschedule?.active && session.reschedule.appointment_id) {
         const appointment_id = session.reschedule.appointment_id;
         const nextService = session.pendingService || picked.service || session.reschedule.service;
@@ -1594,7 +1545,6 @@ app.post("/webhook", async (req: any, res) => {
 
         const prettyService = SERVICES.find((s) => s.key === nextService)?.title || nextService;
 
-        // actualizar lastBooking
         session.lastBooking = {
           appointment_id,
           start: picked.start,
@@ -1621,7 +1571,7 @@ app.post("/webhook", async (req: any, res) => {
         return res.sendStatus(200);
       }
 
-      // flujo normal (nueva cita)
+      // flujo normal
       session.selectedSlot = picked;
       session.state = "await_name";
       await sendWhatsAppText(
@@ -1722,9 +1672,7 @@ app.post("/webhook", async (req: any, res) => {
       return res.sendStatus(200);
     }
 
-    // Si service detectado, intentamos rango
     if (serviceKey) {
-      // ✅ Si estamos reprogramando y el usuario cambió de servicio, lo respetamos
       session.pendingService = serviceKey;
 
       const range = parseDateRangeFromText(userText);
@@ -1758,7 +1706,6 @@ app.post("/webhook", async (req: any, res) => {
       return res.sendStatus(200);
     }
 
-    // Si responde un día y hay pendingService
     if (!serviceKey && session.pendingService) {
       const range = parseDateRangeFromText(userText);
       if (range) {
@@ -1810,13 +1757,13 @@ app.post("/webhook", async (req: any, res) => {
 
     await sendWhatsAppText(from, reply);
     return res.sendStatus(200);
-  } catch (e: any) {
+  } catch (e) {
     console.error("Webhook error:", e?.message || e);
     return res.sendStatus(200);
   } finally {
     try {
       if (from && session) await saveSession(from, session);
-    } catch (e: any) {
+    } catch (e) {
       console.error("saveSession error:", e?.message || e);
     }
   }
@@ -1887,12 +1834,12 @@ async function reminderLoop() {
         });
       }
     }
-  } catch (e: any) {
+  } catch (e) {
     console.error("Reminder loop error:", e?.message || e);
   }
 }
 
-// ✅ Tick para ejecutar recordatorios por ping (ideal si el server “duerme”)
+// ✅ Tick para ejecutar recordatorios por ping
 app.get("/tick", async (_req, res) => {
   try {
     await reminderLoop();
