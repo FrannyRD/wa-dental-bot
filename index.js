@@ -1085,7 +1085,8 @@ function parseDateRangeFromText(userText) {
 
   for (const [name, iso] of Object.entries(DOW)) {
     if (t.includes(name)) {
-      const isNext = t.includes("proximo") || t.includes("próximo") || t.includes("que viene") || t.includes("siguiente");
+      const isNext =
+        t.includes("proximo") || t.includes("próximo") || t.includes("que viene") || t.includes("siguiente");
       const fromDay = nextWeekdayFromTodayUTC(iso, CLINIC_TIMEZONE, isNext);
       const toDay = addLocalDaysUTC(fromDay, 1, CLINIC_TIMEZONE);
       return { from: fromDay.toISOString(), to: toDay.toISOString(), label: name };
@@ -1176,7 +1177,7 @@ function formatSlotsList(serviceKey, slots, session) {
   );
 }
 
-// ✅ NEW: parsear hora del usuario con AM/PM robusto (incluye "p. m.", "a. m.", "p m", "a m")
+// ✅ FIX: parsear hora del usuario con AM/PM robusto (pero NO interpretar "1" / "10" como hora)
 function parseUserTimeTo24h(userText) {
   const raw = String(userText || "").trim().toLowerCase();
   if (!raw) return null;
@@ -1187,7 +1188,11 @@ function parseUserTimeTo24h(userText) {
   // normaliza "p m" -> "pm", "a m" -> "am"
   compact = compact.replace(/\b([ap])\s*m\b/g, "$1m");
 
-  // acepta: "3", "3pm", "3 pm", "3:00 pm", "15:00", "12:15am"
+  // ✅ FIX CLAVE:
+  // Si el usuario escribió SOLO un número (ej: "1", "10"), lo tratamos como opción del listado, NO como hora.
+  if (/^\d{1,2}$/.test(compact)) return null;
+
+  // acepta: "3pm", "3 pm", "3:00 pm", "15:00", "12:15am", "10:00"
   const m = compact.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i);
   if (!m) return null;
 
@@ -1204,7 +1209,7 @@ function parseUserTimeTo24h(userText) {
     if (mer === "pm" && hh !== 12) hh += 12;
     if (mer === "am" && hh === 12) hh = 0;
   } else {
-    // sin meridiano: permitimos 0-23
+    // sin meridiano: permitimos 0-23 (pero ya no aceptamos "10" solo; debe venir con ":" o am/pm)
     if (hh < 0 || hh > 23) return null;
   }
 
@@ -1739,9 +1744,51 @@ app.post("/webhook", async (req, res) => {
     // AWAIT SLOT CHOICE
     // =========================
     if (session.state === "await_slot_choice" && session.lastSlots?.length) {
+      // ✅ FIX: permitir salir del estado pegado con comandos
+      if (["reiniciar", "reset", "resetear", "empezar", "inicio"].some((k) => tNorm.includes(k))) {
+        session.state = "idle";
+        session.lastSlots = [];
+        session.lastDisplaySlots = [];
+        session.selectedSlot = null;
+        session.pendingRange = null;
+        session.pendingName = null;
+        session.reschedule = defaultSession().reschedule;
+
+        await sendWhatsAppText(from, `Listo ✅ Reinicié el proceso.\n¿Qué servicio deseas agendar?`);
+        await sendWhatsAppText(from, servicesEmojiText());
+        await sendServicesList(from);
+        return res.sendStatus(200);
+      }
+
+      if (["reprogramar", "cambiar", "otro dia", "otro día"].some((k) => tNorm.includes(k))) {
+        session.state = "await_day";
+        session.lastSlots = [];
+        session.lastDisplaySlots = [];
+        session.selectedSlot = null;
+        session.pendingRange = null;
+        session.pendingName = null;
+
+        const prettyService =
+          SERVICES.find((s) => s.key === session.pendingService)?.title || session.pendingService || "tu servicio";
+        await sendWhatsAppText(
+          from,
+          `Perfecto ✅ Vamos a elegir *otro día* para *${prettyService}*.\n\n¿Para qué día?\nEj: "mañana", "viernes", "próximo martes", "la semana que viene" o "14 de junio".`
+        );
+        return res.sendStatus(200);
+      }
+
       const picked = tryPickSlotFromUserText(session, userText);
 
       if (!picked) {
+        // ✅ FIX: si mandó un número (opción) pero no existe en la lista
+        if (/^\d+$/.test(tNorm)) {
+          await sendWhatsAppText(
+            from,
+            `Ese número no corresponde a un horario disponible 🙏\nResponde con uno de los números que ves en la lista, o escribe una hora como "10:00 am".`
+          );
+          return res.sendStatus(200);
+        }
+
         const parsed = parseUserTimeTo24h(userText);
 
         if (parsed) {
