@@ -499,6 +499,22 @@ function formatDateInTZ(iso, timeZone) {
 }
 
 // =========================
+// ✅ WhatsApp helpers (NEW, no rompe lo existente)
+// =========================
+function normalizePhoneDigits(raw) {
+  return String(raw || "").replace(/[^\d]/g, "");
+}
+
+// ✅ Si el cliente escribe 8/10 dígitos (RD), lo convertimos a 1 + 10 dígitos (E.164 sin +)
+// Ej: 8494034785 -> 18494034785
+function toE164DigitsRD(phoneDigits) {
+  const d = normalizePhoneDigits(phoneDigits);
+  if (d.length === 10) return "1" + d; // RD NANP
+  if (d.length === 11 && d.startsWith("1")) return d;
+  return d;
+}
+
+// =========================
 // WhatsApp send text / interactive list
 // =========================
 async function sendWhatsAppText(to, text, reportSource = "BOT") {
@@ -516,6 +532,40 @@ async function sendWhatsAppText(to, text, reportSource = "BOT") {
     source: reportSource,
     kind: "TEXT",
   });
+}
+
+// ✅ NEW: envío seguro para recordatorios (prioriza wa_id real del webhook)
+async function sendReminderWhatsAppToBestTarget(priv, fallbackPhoneDigits, text) {
+  const candidates = [];
+
+  // 1) wa_id (lo más confiable)
+  if (priv?.wa_id) candidates.push(String(priv.wa_id).trim());
+
+  // 2) wa_phone guardado (puede venir sin código, lo normalizamos a RD)
+  if (priv?.wa_phone) candidates.push(toE164DigitsRD(priv.wa_phone));
+
+  // 3) fallback (por si acaso)
+  if (fallbackPhoneDigits) candidates.push(toE164DigitsRD(fallbackPhoneDigits));
+
+  const tried = [];
+  let lastErr = null;
+
+  for (const c of candidates) {
+    const to = String(c || "").replace(/[^\d]/g, "");
+    if (!to) continue;
+    if (tried.includes(to)) continue;
+    tried.push(to);
+
+    try {
+      await sendWhatsAppText(to, text, "BOT");
+      return { ok: true, to };
+    } catch (e) {
+      lastErr = e;
+      console.error("[reminder] send failed for:", to, e?.response?.data || e?.message || e);
+    }
+  }
+
+  return { ok: false, tried, error: lastErr?.response?.data || lastErr?.message || lastErr };
 }
 
 async function notifyPersonalWhatsAppBookingSummary(booking) {
@@ -788,7 +838,16 @@ async function getAvailableSlotsTool({ service, from, to }) {
 // =========================
 // Calendar: book / reschedule / cancel
 // =========================
-async function bookAppointmentTool({ patient_name, phone, slot_id, service, notes, slot_start, slot_end }) {
+async function bookAppointmentTool({
+  patient_name,
+  phone,
+  slot_id,
+  service,
+  notes,
+  slot_start,
+  slot_end,
+  wa_id, // ✅ NEW (opcional, no rompe llamadas viejas)
+}) {
   const calendar = getCalendarClient();
   if (!slot_start || !slot_end) throw new Error("Missing slot_start/slot_end");
 
@@ -803,6 +862,7 @@ async function bookAppointmentTool({ patient_name, phone, slot_id, service, note
       extendedProperties: {
         private: {
           wa_phone: phone,
+          wa_id: wa_id || "", // ✅ NEW: destino real del webhook (para recordatorios)
           patient_name,
           service,
           slot_id,
@@ -816,7 +876,16 @@ async function bookAppointmentTool({ patient_name, phone, slot_id, service, note
   return { appointment_id: event.data.id, start: slot_start, end: slot_end, service, patient_name, phone };
 }
 
-async function rescheduleAppointmentTool({ appointment_id, new_slot_id, new_start, new_end, service, patient_name, phone }) {
+async function rescheduleAppointmentTool({
+  appointment_id,
+  new_slot_id,
+  new_start,
+  new_end,
+  service,
+  patient_name,
+  phone,
+  wa_id, // ✅ NEW (opcional)
+}) {
   const calendar = getCalendarClient();
   if (!new_start || !new_end) throw new Error("Missing new_start/new_end");
 
@@ -826,6 +895,7 @@ async function rescheduleAppointmentTool({ appointment_id, new_slot_id, new_star
   const nextService = String(service || priv.service || "").trim();
   const nextName = String(patient_name || priv.patient_name || "").trim();
   const nextPhone = String(phone || priv.wa_phone || "").trim();
+  const nextWaId = String(wa_id || priv.wa_id || "").trim();
 
   const nextPriv = {
     ...priv,
@@ -837,6 +907,7 @@ async function rescheduleAppointmentTool({ appointment_id, new_slot_id, new_star
   if (nextService) nextPriv.service = nextService;
   if (nextName) nextPriv.patient_name = nextName;
   if (nextPhone) nextPriv.wa_phone = nextPhone;
+  if (nextWaId) nextPriv.wa_id = nextWaId;
 
   const nextSummary =
     nextService && nextName ? `Cita - ${nextService} - ${nextName}` : current.data.summary || "Cita";
@@ -945,7 +1016,10 @@ function nextWeekdayFromTodayUTC(targetIsoDow, tz, isNext = false) {
 function rangeForWholeMonth(year, month) {
   const from = zonedTimeToUtc({ year, month, day: 1, hour: 0, minute: 0 }, CLINIC_TIMEZONE);
   const toMonth = month === 12 ? { year: year + 1, month: 1 } : { year, month: month + 1 };
-  const to = zonedTimeToUtc({ year: toMonth.year, month: toMonth.month, day: 1, hour: 0, minute: 0 }, CLINIC_TIMEZONE);
+  const to = zonedTimeToUtc(
+    { year: toMonth.year, month: toMonth.month, day: 1, hour: 0, minute: 0 },
+    CLINIC_TIMEZONE
+  );
   return { from: from.toISOString(), to: to.toISOString() };
 }
 
@@ -1541,6 +1615,7 @@ app.post("/webhook", async (req, res) => {
           service: nextService,
           patient_name: session.reschedule.patient_name,
           phone: session.reschedule.phone || from,
+          wa_id: from, // ✅ NEW: mantenemos wa_id actualizado
         });
 
         const prettyService = SERVICES.find((s) => s.key === nextService)?.title || nextService;
@@ -1614,6 +1689,7 @@ app.post("/webhook", async (req, res) => {
         notes: "",
         slot_start: slot.start,
         slot_end: slot.end,
+        wa_id: from, // ✅ NEW: guardamos wa_id real para recordatorios
       });
 
       const prettyService = SERVICES.find((s) => s.key === booked.service)?.title || booked.service;
@@ -1805,33 +1881,42 @@ async function reminderLoop() {
       const start = new Date(startISO);
       const minutesToStart = Math.round((start.getTime() - now.getTime()) / 60000);
 
-      if (
-        REMINDER_24H &&
-        minutesToStart <= 24 * 60 &&
-        minutesToStart >= 24 * 60 - 30 &&
-        priv.reminder24hSent !== "true"
-      ) {
-        await sendWhatsAppText(
-          phone,
-          `Recordatorio 🦷: tienes cita mañana a las ${formatTimeInTZ(startISO, CLINIC_TIMEZONE)} en ${CLINIC_NAME}.\n\nResponde:\n1) Confirmar\n2) Reprogramar\n3) Cancelar`
-        );
-        await calendar.events.patch({
-          calendarId: GOOGLE_CALENDAR_ID,
-          eventId: ev.id,
-          requestBody: { extendedProperties: { private: { ...priv, reminder24hSent: "true" } } },
-        });
+      // ✅ NEW: ventanas más amplias (para Render Free + cold start) sin spamear por flags
+      const in24hWindow = minutesToStart <= 25 * 60 && minutesToStart >= 23 * 60; // 23h - 25h
+      const in2hWindow = minutesToStart <= 135 && minutesToStart >= 90; // 1h30 - 2h15
+
+      if (REMINDER_24H && in24hWindow && priv.reminder24hSent !== "true") {
+        const msg =
+          `Recordatorio 🦷: tienes cita mañana a las ${formatTimeInTZ(startISO, CLINIC_TIMEZONE)} en ${CLINIC_NAME}.\n\nResponde:\n1) Confirmar\n2) Reprogramar\n3) Cancelar`;
+
+        const sendRes = await sendReminderWhatsAppToBestTarget(priv, phone, msg);
+
+        if (sendRes.ok) {
+          await calendar.events.patch({
+            calendarId: GOOGLE_CALENDAR_ID,
+            eventId: ev.id,
+            requestBody: { extendedProperties: { private: { ...priv, reminder24hSent: "true" } } },
+          });
+        } else {
+          console.error("[reminder24h] could not send", { tried: sendRes.tried, error: sendRes.error });
+        }
       }
 
-      if (REMINDER_2H && minutesToStart <= 120 && minutesToStart >= 105 && priv.reminder2hSent !== "true") {
-        await sendWhatsAppText(
-          phone,
-          `Recordatorio 🦷: tu cita es hoy a las ${formatTimeInTZ(startISO, CLINIC_TIMEZONE)} en ${CLINIC_NAME}.\nDirección: ${CLINIC_ADDRESS || "—"}\n\nResponde:\n1) Confirmar\n2) Reprogramar\n3) Cancelar`
-        );
-        await calendar.events.patch({
-          calendarId: GOOGLE_CALENDAR_ID,
-          eventId: ev.id,
-          requestBody: { extendedProperties: { private: { ...priv, reminder2hSent: "true" } } },
-        });
+      if (REMINDER_2H && in2hWindow && priv.reminder2hSent !== "true") {
+        const msg =
+          `Recordatorio 🦷: tu cita es hoy a las ${formatTimeInTZ(startISO, CLINIC_TIMEZONE)} en ${CLINIC_NAME}.\nDirección: ${CLINIC_ADDRESS || "—"}\n\nResponde:\n1) Confirmar\n2) Reprogramar\n3) Cancelar`;
+
+        const sendRes = await sendReminderWhatsAppToBestTarget(priv, phone, msg);
+
+        if (sendRes.ok) {
+          await calendar.events.patch({
+            calendarId: GOOGLE_CALENDAR_ID,
+            eventId: ev.id,
+            requestBody: { extendedProperties: { private: { ...priv, reminder2hSent: "true" } } },
+          });
+        } else {
+          console.error("[reminder2h] could not send", { tried: sendRes.tried, error: sendRes.error });
+        }
       }
     }
   } catch (e) {
