@@ -2,6 +2,7 @@ import express from "express";
 import axios from "axios";
 import crypto from "crypto";
 import { google } from "googleapis";
+import Redis from "ioredis";
 
 // =========================
 // ENV
@@ -28,36 +29,141 @@ const REMINDER_24H = (process.env.REMINDER_24H || "1") === "1";
 const REMINDER_2H = (process.env.REMINDER_2H || "1") === "1";
 
 // ✅ NEW: tu WhatsApp personal para recibir resumen de citas
-// Ej: 1809XXXXXXX o 809XXXXXXX (solo dígitos)
 const PERSONAL_WA_TO = (process.env.PERSONAL_WA_TO || "").trim();
 
 // =========================
 // ✅ BOTHUB (para ver todo en el Hub)
 // =========================
-const BOTHUB_WEBHOOK_URL = process.env.BOTHUB_WEBHOOK_URL || ""; // URL completa: .../api/webhooks/webhook/:botId
+const BOTHUB_WEBHOOK_URL = process.env.BOTHUB_WEBHOOK_URL || "";
 const BOTHUB_WEBHOOK_SECRET = process.env.BOTHUB_WEBHOOK_SECRET || "";
 const BOTHUB_TIMEOUT_MS = Number(process.env.BOTHUB_TIMEOUT_MS || 6000);
+
+// =========================
+// ✅ PERSISTENCIA (REDIS)
+// =========================
+const REDIS_URL_RAW = (process.env.REDIS_URL || "").trim();
+const SESSION_TTL_SEC = parseInt(process.env.SESSION_TTL_SEC || String(60 * 60 * 24 * 14), 10); // 14 días
+const SESSION_PREFIX = process.env.SESSION_PREFIX || "tekko:dental:sess:";
+
+function normalizeRedisUrl(url: string) {
+  const u = String(url || "").trim();
+  if (!u) return "";
+  if (u.startsWith("redis://")) return "rediss://" + u.slice("redis://".length);
+  return u;
+}
+
+const redisUrl = normalizeRedisUrl(REDIS_URL_RAW);
+const redis =
+  redisUrl
+    ? new Redis(redisUrl, {
+        tls: redisUrl.startsWith("rediss://") ? { rejectUnauthorized: false } : undefined,
+        maxRetriesPerRequest: 2,
+        enableReadyCheck: true,
+      })
+    : null;
+
+// fallback in-memory si no configuras REDIS_URL
+const sessions = new Map<string, any>();
+
+function defaultSession() {
+  return {
+    messages: [],
+    state: "idle", // idle | await_slot_choice | await_name | await_phone | post_booking | await_day
+    lastSlots: [],
+    selectedSlot: null,
+    pendingService: null,
+    pendingRange: null,
+    pendingName: null,
+    lastBooking: null, // {appointment_id,start,end,service,patient_name,phone}
+    greeted: false,
+
+    // ✅ dedupe webhook retries
+    lastMsgId: null,
+
+    // ✅ NUEVO: modo reprogramación (para no crear evento nuevo)
+    reschedule: {
+      active: false,
+      appointment_id: "",
+      phone: "",
+      patient_name: "",
+      service: "",
+    },
+  };
+}
+
+function sanitizeSession(session: any) {
+  if (!session || typeof session !== "object") return defaultSession();
+  if (!Array.isArray(session.messages)) session.messages = [];
+  session.messages = session.messages.slice(-20);
+
+  if (!Array.isArray(session.lastSlots)) session.lastSlots = [];
+  session.lastSlots = session.lastSlots.slice(0, 10);
+
+  if (!session.reschedule || typeof session.reschedule !== "object") {
+    session.reschedule = defaultSession().reschedule;
+  } else {
+    if (typeof session.reschedule.active !== "boolean") session.reschedule.active = false;
+    if (typeof session.reschedule.appointment_id !== "string") session.reschedule.appointment_id = "";
+    if (typeof session.reschedule.phone !== "string") session.reschedule.phone = "";
+    if (typeof session.reschedule.patient_name !== "string") session.reschedule.patient_name = "";
+    if (typeof session.reschedule.service !== "string") session.reschedule.service = "";
+  }
+
+  // compat de campos
+  if (typeof session.state !== "string") session.state = "idle";
+  if (typeof session.greeted !== "boolean") session.greeted = false;
+
+  return session;
+}
+
+async function getSession(userId: string) {
+  if (!userId) return sanitizeSession(defaultSession());
+
+  if (!redis) {
+    if (!sessions.has(userId)) sessions.set(userId, defaultSession());
+    return sanitizeSession(sessions.get(userId));
+  }
+
+  const key = `${SESSION_PREFIX}${userId}`;
+  const raw = await redis.get(key);
+  const s = raw ? safeJson(raw, defaultSession()) : defaultSession();
+  return sanitizeSession(s);
+}
+
+async function saveSession(userId: string, session: any) {
+  if (!userId || !session) return;
+
+  session = sanitizeSession(session);
+
+  if (!redis) {
+    sessions.set(userId, session);
+    return;
+  }
+
+  const key = `${SESSION_PREFIX}${userId}`;
+  await redis.set(key, JSON.stringify(session), "EX", SESSION_TTL_SEC);
+}
 
 // =====================================================
 // Stable stringify (para firma HMAC consistente)
 // =====================================================
-function stableStringify(obj) {
+function stableStringify(obj: any) {
   if (obj === null || typeof obj !== "object") return JSON.stringify(obj);
   if (Array.isArray(obj)) return `[${obj.map(stableStringify).join(",")}]`;
   const keys = Object.keys(obj).sort();
   return `{${keys.map((k) => JSON.stringify(k) + ":" + stableStringify(obj[k])).join(",")}}`;
 }
 
-function bothubHmacStable(payload, secret) {
+function bothubHmacStable(payload: any, secret: string) {
   const raw = stableStringify(payload);
   return crypto.createHmac("sha256", secret).update(raw).digest("hex");
 }
 
-function bothubHmacJson(payload, secret) {
+function bothubHmacJson(payload: any, secret: string) {
   return crypto.createHmac("sha256", secret).update(JSON.stringify(payload)).digest("hex");
 }
 
-function getHubSignature(req) {
+function getHubSignature(req: any) {
   const h =
     req.get("X-HUB-SIGNATURE") ||
     req.get("x-hub-signature") ||
@@ -72,15 +178,14 @@ function getHubSignature(req) {
   return sig.startsWith("sha256=") ? sig.slice("sha256=".length) : sig;
 }
 
-function timingSafeEqualHex(aHex, bHex) {
+function timingSafeEqualHex(aHex: string, bHex: string) {
   const a = Buffer.from(String(aHex || ""), "utf8");
   const b = Buffer.from(String(bHex || ""), "utf8");
   if (!a.length || a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
 }
 
-// ✅ Validador robusto: acepta firma con stableStringify o JSON.stringify
-function verifyHubSignature(reqBody, signatureHex, secret) {
+function verifyHubSignature(reqBody: any, signatureHex: string, secret: string) {
   if (!signatureHex || !secret) return false;
 
   const expectedStable = bothubHmacStable(reqBody, secret);
@@ -92,8 +197,7 @@ function verifyHubSignature(reqBody, signatureHex, secret) {
   return false;
 }
 
-async function bothubReportMessage(payload) {
-  // NO rompe tu bot si no está configurado
+async function bothubReportMessage(payload: any) {
   if (!BOTHUB_WEBHOOK_URL || !BOTHUB_WEBHOOK_SECRET) return;
 
   try {
@@ -105,13 +209,13 @@ async function bothubReportMessage(payload) {
       },
       timeout: BOTHUB_TIMEOUT_MS,
     });
-  } catch (e) {
+  } catch (e: any) {
     console.error("Bothub report failed:", e?.response?.data || e?.message || e);
   }
 }
 
 // ✅ Meta para audio/ubicación/attachments (para que en Hub se vea TODO)
-function extractInboundMeta(msg) {
+function extractInboundMeta(msg: any) {
   if (!msg) return {};
 
   if (msg?.type === "audio") {
@@ -174,36 +278,11 @@ function extractInboundMeta(msg) {
 const app = express();
 app.use(
   express.json({
-    verify: (req, _res, buf) => {
+    verify: (req: any, _res, buf) => {
       req.rawBody = buf;
     },
   })
 );
-
-// =========================
-// Simple memory (MVP)
-// In prod: Redis / DB
-// =========================
-const sessions = new Map();
-function getSession(userId) {
-  if (!sessions.has(userId)) {
-    sessions.set(userId, {
-      messages: [],
-      state: "idle", // idle | await_slot_choice | await_name | await_phone | post_booking | await_day
-      lastSlots: [],
-      selectedSlot: null,
-      pendingService: null,
-      pendingRange: null,
-      pendingName: null,
-      lastBooking: null, // {appointment_id,start,end,service,patient_name,phone}
-      greeted: false, // NEW: to show services menu once per session
-
-      // ✅ NEW: dedupe webhook retries
-      lastMsgId: null,
-    });
-  }
-  return sessions.get(userId);
-}
 
 // =========================
 // Services (requested list)
@@ -217,12 +296,12 @@ const SERVICES = [
   { key: "odontopediatria", title: "Odontopediatría", id: "svc_odontopediatria" },
 ];
 
-const SERVICE_ID_TO_KEY = Object.fromEntries(SERVICES.map((s) => [s.id, s.key]));
+const SERVICE_ID_TO_KEY: Record<string, string> = Object.fromEntries(SERVICES.map((s) => [s.id, s.key]));
 
 // =========================
 // Helpers
 // =========================
-function safeJson(str, fallback) {
+function safeJson(str: any, fallback: any) {
   try {
     return JSON.parse(str);
   } catch {
@@ -254,7 +333,7 @@ function defaultServiceDuration() {
   };
 }
 
-function verifyMetaSignature(req) {
+function verifyMetaSignature(req: any) {
   if (!META_APP_SECRET) return true;
   const signature = req.get("X-Hub-Signature-256");
   if (!signature) return false;
@@ -273,11 +352,11 @@ function verifyMetaSignature(req) {
   }
 }
 
-function addMinutes(date, minutes) {
+function addMinutes(date: Date, minutes: number) {
   return new Date(date.getTime() + minutes * 60000);
 }
 
-function normalizeText(t) {
+function normalizeText(t: string) {
   return (t || "")
     .toLowerCase()
     .normalize("NFD")
@@ -286,12 +365,13 @@ function normalizeText(t) {
     .trim();
 }
 
-function weekdayKeyFromISOWeekday(isoWeekday) {
-  return ["", "mon", "tue", "wed", "thu", "fri", "sat", "sun"][isoWeekday];
+function weekdayKeyFromISOWeekday(isoWeekday: number) {
+  // 1..7 => mon..sun
+  return ["", "mon", "tue", "wed", "thu", "fri", "sat", "sun"][isoWeekday] as any;
 }
 
 // NEW: detectar saludo para evitar doble respuesta
-function isGreeting(textNorm) {
+function isGreeting(textNorm: string) {
   const t = textNorm || "";
   const greetings = [
     "hola",
@@ -331,8 +411,43 @@ function quickHelpText() {
   );
 }
 
+function isThanks(textNorm: string) {
+  return ["gracias", "ok", "okay", "listo", "perfecto", "dale", "bien", "genial"].some(
+    (k) => textNorm === k || textNorm.includes(k)
+  );
+}
+
+function isChoice(textNorm: string, n: number) {
+  const t = (textNorm || "").trim();
+  return t === String(n) || t === `${n}.` || t.startsWith(`${n} `);
+}
+
+function looksLikeConfirm(textNorm: string) {
+  return ["confirmar", "confirmo", "confirmada", "confirmado", "confirmacion", "confirmación"].some((k) =>
+    (textNorm || "").includes(k)
+  );
+}
+
+function looksLikeCancel(textNorm: string) {
+  return ["cancelar", "cancela", "anular", "anula", "no puedo", "ya no", "cancelacion", "cancelación"].some((k) =>
+    (textNorm || "").includes(k)
+  );
+}
+
+function looksLikeReschedule(textNorm: string) {
+  return ["reprogramar", "reprograma", "cambiar", "cambio", "mover", "posponer", "otro horario"].some((k) =>
+    (textNorm || "").includes(k)
+  );
+}
+
+function looksLikeNewAppointment(textNorm: string) {
+  return ["nueva cita", "otra cita", "agendar", "reservar", "cita nueva", "quiero cita"].some((k) =>
+    (textNorm || "").includes(k)
+  );
+}
+
 // ---- Timezone utilities ----
-function getZonedParts(date, timeZone) {
+function getZonedParts(date: Date, timeZone: string) {
   const fmt = new Intl.DateTimeFormat("en-CA", {
     timeZone,
     year: "numeric",
@@ -344,7 +459,7 @@ function getZonedParts(date, timeZone) {
     hour12: false,
   });
   const parts = fmt.formatToParts(date);
-  const obj = {};
+  const obj: any = {};
   for (const p of parts) obj[p.type] = p.value;
   return {
     year: parseInt(obj.year, 10),
@@ -356,19 +471,22 @@ function getZonedParts(date, timeZone) {
   };
 }
 
-function getOffsetMinutes(date, timeZone) {
+function getOffsetMinutes(date: Date, timeZone: string) {
   const p = getZonedParts(date, timeZone);
   const asUTC = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
   return (asUTC - date.getTime()) / 60000;
 }
 
-function zonedTimeToUtc({ year, month, day, hour, minute, second = 0 }, timeZone) {
+function zonedTimeToUtc(
+  { year, month, day, hour, minute, second = 0 }: any,
+  timeZone: string
+) {
   const guess = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
   const offsetMin = getOffsetMinutes(guess, timeZone);
   return new Date(Date.UTC(year, month - 1, day, hour, minute, second) - offsetMin * 60000);
 }
 
-function formatTimeInTZ(iso, timeZone) {
+function formatTimeInTZ(iso: string, timeZone: string) {
   const d = new Date(iso);
   return new Intl.DateTimeFormat("es-DO", {
     timeZone,
@@ -378,7 +496,7 @@ function formatTimeInTZ(iso, timeZone) {
   }).format(d);
 }
 
-function formatDateInTZ(iso, timeZone) {
+function formatDateInTZ(iso: string, timeZone: string) {
   const d = new Date(iso);
   return new Intl.DateTimeFormat("es-DO", {
     timeZone,
@@ -389,35 +507,10 @@ function formatDateInTZ(iso, timeZone) {
   }).format(d);
 }
 
-function isThanks(textNorm) {
-  return ["gracias", "ok", "okay", "listo", "perfecto", "dale", "bien", "genial"].some(
-    (k) => textNorm === k || textNorm.includes(k)
-  );
-}
-
-function looksLikeCancel(textNorm) {
-  return ["cancelar", "cancela", "anular", "anula", "no puedo", "ya no", "cancelacion"].some((k) =>
-    textNorm.includes(k)
-  );
-}
-
-function looksLikeReschedule(textNorm) {
-  return ["reprogramar", "reprograma", "cambiar", "cambio", "mover", "posponer", "otro horario"].some((k) =>
-    textNorm.includes(k)
-  );
-}
-
-function looksLikeNewAppointment(textNorm) {
-  return ["nueva cita", "otra cita", "agendar", "reservar", "cita nueva", "quiero cita"].some((k) =>
-    textNorm.includes(k)
-  );
-}
-
 // =========================
 // WhatsApp send text / interactive list
-// ✅ (solo añadimos reporte al Hub)
 // =========================
-async function sendWhatsAppText(to, text, reportSource = "BOT") {
+async function sendWhatsAppText(to: string, text: string, reportSource = "BOT") {
   const url = `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`;
   await axios.post(
     url,
@@ -430,7 +523,6 @@ async function sendWhatsAppText(to, text, reportSource = "BOT") {
     { headers: { Authorization: `Bearer ${WA_TOKEN}` } }
   );
 
-  // ✅ OUTBOUND al Hub
   await bothubReportMessage({
     direction: "OUTBOUND",
     to: String(to),
@@ -441,14 +533,13 @@ async function sendWhatsAppText(to, text, reportSource = "BOT") {
 }
 
 // ✅ NEW: enviar resumen a tu WhatsApp personal cuando se agenda
-async function notifyPersonalWhatsAppBookingSummary(booking) {
+async function notifyPersonalWhatsAppBookingSummary(booking: any) {
   try {
     if (!PERSONAL_WA_TO) return;
 
     const myTo = String(PERSONAL_WA_TO).replace(/[^\d]/g, "");
     if (!myTo) return;
 
-    // evitar enviártelo si por error pusiste el mismo número del paciente
     const patientPhone = String(booking?.phone || "").replace(/[^\d]/g, "");
     if (patientPhone && myTo === patientPhone) return;
 
@@ -466,12 +557,12 @@ async function notifyPersonalWhatsAppBookingSummary(booking) {
       `🆔 ID: ${booking.appointment_id || "—"}`;
 
     await sendWhatsAppText(myTo, summary, "BOT");
-  } catch (e) {
+  } catch (e: any) {
     console.error("notifyPersonalWhatsAppBookingSummary error:", e?.response?.data || e?.message || e);
   }
 }
 
-async function sendServicesList(to) {
+async function sendServicesList(to: string) {
   const url = `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`;
 
   const rows = SERVICES.map((s) => ({
@@ -500,7 +591,6 @@ async function sendServicesList(to) {
     { headers: { Authorization: `Bearer ${WA_TOKEN}` } }
   );
 
-  // ✅ OUTBOUND al Hub (representación texto + meta)
   const rendered =
     `*Nuestros servicios*\nSelecciona un servicio para agendar tu cita 👇\n(O si prefieres, escríbelo)\n\n` +
     rows.map((r) => `• [${r.id}] ${r.title}`).join("\n");
@@ -515,7 +605,7 @@ async function sendServicesList(to) {
   });
 }
 
-// NEW: Primer mensaje con opción A/B (texto + botones)
+// NEW: Primer mensaje con opción A/B
 function servicesEmojiText() {
   return (
     `👋 ¡Hola! Soy el asistente de *${CLINIC_NAME}*.\n\n` +
@@ -550,9 +640,73 @@ function getCalendarClient() {
 }
 
 // =========================
+// ✅ Encontrar cita por teléfono (robusto si sesión se pierde)
+// =========================
+async function findUpcomingAppointmentByPhone(phone: string, windowDays = 120) {
+  try {
+    const phoneDigits = String(phone || "").replace(/[^\d]/g, "");
+    if (!phoneDigits) return null;
+
+    const calendar = getCalendarClient();
+    const now = new Date();
+    const end = addMinutes(now, windowDays * 24 * 60);
+
+    const list = await calendar.events.list({
+      calendarId: GOOGLE_CALENDAR_ID,
+      timeMin: now.toISOString(),
+      timeMax: end.toISOString(),
+      singleEvents: true,
+      orderBy: "startTime",
+      maxResults: 100,
+    });
+
+    const events = list.data.items || [];
+    for (const ev of events) {
+      const priv = ev.extendedProperties?.private || {};
+      if (priv.status === "cancelled") continue;
+
+      const wa = String(priv.wa_phone || "").replace(/[^\d]/g, "");
+      if (!wa || wa !== phoneDigits) continue;
+
+      const start = ev.start?.dateTime;
+      const endDT = ev.end?.dateTime;
+      if (!start || !endDT) continue;
+
+      const service = String(priv.service || "").trim() || inferServiceFromSummary(ev.summary || "");
+      const patient_name = String(priv.patient_name || "").trim() || "";
+
+      return {
+        appointment_id: ev.id,
+        start,
+        end: endDT,
+        service: service || "limpieza_prevencion",
+        patient_name,
+        phone: phoneDigits,
+      };
+    }
+
+    return null;
+  } catch (e: any) {
+    console.error("findUpcomingAppointmentByPhone error:", e?.response?.data || e?.message || e);
+    return null;
+  }
+}
+
+function inferServiceFromSummary(summary: string) {
+  const s = normalizeText(summary || "");
+  if (s.includes("ortodon")) return "ortodoncia";
+  if (s.includes("implan")) return "implantes";
+  if (s.includes("urgenc")) return "urgencias";
+  if (s.includes("limp") || s.includes("prevenc")) return "limpieza_prevencion";
+  if (s.includes("pedi")) return "odontopediatria";
+  if (s.includes("estet") || s.includes("estetic")) return "estetica_dental";
+  return "";
+}
+
+// =========================
 // Calendar: FreeBusy => generate slots (timezone-safe)
 // =========================
-async function getBusyRanges(calendar, timeMinISO, timeMaxISO) {
+async function getBusyRanges(calendar: any, timeMinISO: string, timeMaxISO: string) {
   const fb = await calendar.freebusy.query({
     requestBody: {
       timeMin: timeMinISO,
@@ -563,17 +717,17 @@ async function getBusyRanges(calendar, timeMinISO, timeMaxISO) {
   });
 
   const busy = fb.data.calendars?.[GOOGLE_CALENDAR_ID]?.busy || [];
-  return busy.map((b) => ({
+  return busy.map((b: any) => ({
     start: new Date(b.start),
     end: new Date(b.end),
   }));
 }
 
-function overlaps(aStart, aEnd, bStart, bEnd) {
+function overlaps(aStart: Date, aEnd: Date, bStart: Date, bEnd: Date) {
   return aStart < bEnd && aEnd > bStart;
 }
 
-function buildCandidateSlotsZoned({ service, fromISO, toISO, durationMin }) {
+function buildCandidateSlotsZoned({ service, fromISO, toISO, durationMin }: any) {
   const from = new Date(fromISO);
   const to = new Date(toISO);
 
@@ -589,7 +743,7 @@ function buildCandidateSlotsZoned({ service, fromISO, toISO, durationMin }) {
     CLINIC_TIMEZONE
   );
 
-  const slots = [];
+  const slots: any[] = [];
 
   while (curUTC <= endUTC) {
     const curLocal = getZonedParts(curUTC, CLINIC_TIMEZONE);
@@ -597,11 +751,11 @@ function buildCandidateSlotsZoned({ service, fromISO, toISO, durationMin }) {
     const js = new Date(Date.UTC(curLocal.year, curLocal.month - 1, curLocal.day, 12, 0, 0));
     const isoWeekday = ((js.getUTCDay() + 6) % 7) + 1;
     const key = weekdayKeyFromISOWeekday(isoWeekday);
-    const wh = WORK_HOURS[key];
+    const wh = (WORK_HOURS as any)[key];
 
     if (wh) {
-      const [sh, sm] = wh.start.split(":").map((n) => parseInt(n, 10));
-      const [eh, em] = wh.end.split(":").map((n) => parseInt(n, 10));
+      const [sh, sm] = wh.start.split(":").map((n: string) => parseInt(n, 10));
+      const [eh, em] = wh.end.split(":").map((n: string) => parseInt(n, 10));
 
       let cursorMin = sh * 60 + sm;
       const endMin = eh * 60 + em;
@@ -641,17 +795,17 @@ function buildCandidateSlotsZoned({ service, fromISO, toISO, durationMin }) {
   return slots;
 }
 
-async function getAvailableSlotsTool({ service, from, to }) {
+async function getAvailableSlotsTool({ service, from, to }: any) {
   const calendar = getCalendarClient();
 
-  const durationMin = SERVICE_DURATION[service] || SERVICE_DURATION["otro"] || 30;
+  const durationMin = (SERVICE_DURATION as any)[service] || (SERVICE_DURATION as any)["otro"] || 30;
   const busyRanges = await getBusyRanges(calendar, from, to);
   const candidates = buildCandidateSlotsZoned({ service, fromISO: from, toISO: to, durationMin });
 
-  const free = candidates.filter((c) => {
+  const free = candidates.filter((c: any) => {
     const cs = new Date(c.start);
     const ce = new Date(c.end);
-    return !busyRanges.some((b) => overlaps(cs, ce, b.start, b.end));
+    return !busyRanges.some((b: any) => overlaps(cs, ce, b.start, b.end));
   });
 
   return free.slice(0, 8);
@@ -660,7 +814,7 @@ async function getAvailableSlotsTool({ service, from, to }) {
 // =========================
 // Calendar: book / reschedule / cancel
 // =========================
-async function bookAppointmentTool({ patient_name, phone, slot_id, service, notes, slot_start, slot_end }) {
+async function bookAppointmentTool({ patient_name, phone, slot_id, service, notes, slot_start, slot_end }: any) {
   const calendar = getCalendarClient();
 
   if (!slot_start || !slot_end) throw new Error("Missing slot_start/slot_end");
@@ -696,30 +850,47 @@ async function bookAppointmentTool({ patient_name, phone, slot_id, service, note
   };
 }
 
-async function rescheduleAppointmentTool({ appointment_id, new_slot_id, new_start, new_end }) {
+// ✅ Mejorado: permite opcionalmente actualizar service/patient_name en reprogramación
+async function rescheduleAppointmentTool({ appointment_id, new_slot_id, new_start, new_end, service, patient_name, phone }: any) {
   const calendar = getCalendarClient();
   if (!new_start || !new_end) throw new Error("Missing new_start/new_end");
+
+  const current = await calendar.events.get({ calendarId: GOOGLE_CALENDAR_ID, eventId: appointment_id });
+  const priv = current.data.extendedProperties?.private || {};
+
+  const nextService = String(service || priv.service || "").trim();
+  const nextName = String(patient_name || priv.patient_name || "").trim();
+  const nextPhone = String(phone || priv.wa_phone || "").trim();
+
+  const nextPriv = {
+    ...priv,
+    slot_id: new_slot_id,
+    reminder24hSent: "false",
+    reminder2hSent: "false",
+  } as any;
+
+  if (nextService) nextPriv.service = nextService;
+  if (nextName) nextPriv.patient_name = nextName;
+  if (nextPhone) nextPriv.wa_phone = nextPhone;
+
+  const nextSummary =
+    nextService && nextName ? `Cita - ${nextService} - ${nextName}` : (current.data.summary || "Cita");
 
   const updated = await calendar.events.patch({
     calendarId: GOOGLE_CALENDAR_ID,
     eventId: appointment_id,
     requestBody: {
+      summary: nextSummary,
       start: { dateTime: new_start, timeZone: CLINIC_TIMEZONE },
       end: { dateTime: new_end, timeZone: CLINIC_TIMEZONE },
-      extendedProperties: {
-        private: {
-          slot_id: new_slot_id,
-          reminder24hSent: "false",
-          reminder2hSent: "false",
-        },
-      },
+      extendedProperties: { private: nextPriv },
     },
   });
 
   return { ok: true, appointment_id: updated.data.id, new_start, new_end };
 }
 
-async function cancelAppointmentTool({ appointment_id, reason }) {
+async function cancelAppointmentTool({ appointment_id, reason }: any) {
   const calendar = getCalendarClient();
 
   const event = await calendar.events.get({ calendarId: GOOGLE_CALENDAR_ID, eventId: appointment_id });
@@ -743,14 +914,14 @@ async function cancelAppointmentTool({ appointment_id, reason }) {
   return { ok: true, appointment_id };
 }
 
-async function handoffToHumanTool({ summary }) {
+async function handoffToHumanTool({ summary }: any) {
   return { ok: true, routed: true, summary };
 }
 
 // =========================
 // Date parsing (improved)
 // =========================
-const DOW = {
+const DOW: Record<string, number> = {
   lunes: 1,
   martes: 2,
   miercoles: 3,
@@ -762,7 +933,7 @@ const DOW = {
   domingo: 7,
 };
 
-const MONTHS = {
+const MONTHS: Record<string, number> = {
   enero: 1,
   febrero: 2,
   marzo: 3,
@@ -778,12 +949,12 @@ const MONTHS = {
   diciembre: 12,
 };
 
-function startOfLocalDayUTC(date, tz) {
+function startOfLocalDayUTC(date: Date, tz: string) {
   const p = getZonedParts(date, tz);
   return zonedTimeToUtc({ year: p.year, month: p.month, day: p.day, hour: 0, minute: 0 }, tz);
 }
 
-function addLocalDaysUTC(dateUTC, days, tz) {
+function addLocalDaysUTC(dateUTC: Date, days: number, tz: string) {
   const p = getZonedParts(dateUTC, tz);
   const base = new Date(Date.UTC(p.year, p.month - 1, p.day, 12, 0, 0));
   base.setUTCDate(base.getUTCDate() + days);
@@ -793,7 +964,7 @@ function addLocalDaysUTC(dateUTC, days, tz) {
   );
 }
 
-function nextWeekdayFromTodayUTC(targetIsoDow, tz, isNext = false) {
+function nextWeekdayFromTodayUTC(targetIsoDow: number, tz: string, isNext = false) {
   const now = new Date();
   const todayLocal = startOfLocalDayUTC(now, tz);
 
@@ -809,18 +980,16 @@ function nextWeekdayFromTodayUTC(targetIsoDow, tz, isNext = false) {
   return addLocalDaysUTC(todayLocal, diff, tz);
 }
 
-// NEW: range helpers
-function rangeForWholeMonth(year, month) {
+function rangeForWholeMonth(year: number, month: number) {
   const from = zonedTimeToUtc({ year, month, day: 1, hour: 0, minute: 0 }, CLINIC_TIMEZONE);
   const toMonth = month === 12 ? { year: year + 1, month: 1 } : { year, month: month + 1 };
   const to = zonedTimeToUtc({ year: toMonth.year, month: toMonth.month, day: 1, hour: 0, minute: 0 }, CLINIC_TIMEZONE);
   return { from: from.toISOString(), to: to.toISOString() };
 }
 
-function parseDateRangeFromText(userText) {
+function parseDateRangeFromText(userText: string) {
   const t = normalizeText(userText);
 
-  // hoy / mañana / pasado mañana
   if (t.includes("hoy")) {
     const from = startOfLocalDayUTC(new Date(), CLINIC_TIMEZONE);
     const to = addLocalDaysUTC(from, 1, CLINIC_TIMEZONE);
@@ -837,14 +1006,12 @@ function parseDateRangeFromText(userText) {
     return { from: from.toISOString(), to: to.toISOString(), label: "mañana" };
   }
 
-  // "la semana que viene"
   if (t.includes("semana que viene") || t.includes("la semana que viene") || t.includes("siguiente semana")) {
     const from = addLocalDaysUTC(startOfLocalDayUTC(new Date(), CLINIC_TIMEZONE), 1, CLINIC_TIMEZONE);
     const to = addLocalDaysUTC(from, 7, CLINIC_TIMEZONE);
     return { from: from.toISOString(), to: to.toISOString(), label: "la semana que viene" };
   }
 
-  // "en junio"
   for (const [mname, mnum] of Object.entries(MONTHS)) {
     if (t === mname || t.includes(`en ${mname}`) || t.includes(`para ${mname}`)) {
       const nowP = getZonedParts(new Date(), CLINIC_TIMEZONE);
@@ -855,7 +1022,6 @@ function parseDateRangeFromText(userText) {
     }
   }
 
-  // "el viernes" / "proximo martes"
   for (const [name, iso] of Object.entries(DOW)) {
     if (t.includes(name)) {
       const isNext = t.includes("proximo") || t.includes("próximo") || t.includes("que viene") || t.includes("siguiente");
@@ -865,7 +1031,6 @@ function parseDateRangeFromText(userText) {
     }
   }
 
-  // "14 de junio"
   const m1 = t.match(/(\d{1,2})\s+de\s+([a-záéíóú]+)(\s+de\s+(\d{4}))?/);
   if (m1) {
     const day = parseInt(m1[1], 10);
@@ -893,7 +1058,7 @@ function parseDateRangeFromText(userText) {
 // =========================
 // Slot formatting
 // =========================
-function formatSlotsList(serviceKey, slots) {
+function formatSlotsList(serviceKey: string, slots: any[]) {
   if (!slots?.length) return null;
   const dateLabel = formatDateInTZ(slots[0].start, CLINIC_TIMEZONE);
   const prettyService = SERVICES.find((s) => s.key === serviceKey)?.title || serviceKey;
@@ -909,7 +1074,7 @@ function formatSlotsList(serviceKey, slots) {
   )}\n\nResponde con el *número* (1,2,3...) o escribe la *hora* (ej: 10:00).`;
 }
 
-function tryPickSlotFromUserText(session, userText) {
+function tryPickSlotFromUserText(session: any, userText: string) {
   const t = normalizeText(userText);
 
   const num = parseInt(t, 10);
@@ -922,7 +1087,7 @@ function tryPickSlotFromUserText(session, userText) {
     const hh = parseInt(m[1], 10);
     const mm = m[2] ? parseInt(m[2], 10) : 0;
 
-    const found = session.lastSlots.find((s) => {
+    const found = session.lastSlots.find((s: any) => {
       const d = new Date(s.start);
       const parts = getZonedParts(d, CLINIC_TIMEZONE);
       return parts.hour === hh && parts.minute === mm;
@@ -936,9 +1101,7 @@ function tryPickSlotFromUserText(session, userText) {
 // =========================
 // OpenAI: tool calling (kept)
 // =========================
-async function callOpenAI({ userId, userText, userPhone, extraSystem = "" }) {
-  const session = getSession(userId);
-
+async function callOpenAI({ session, userId, userText, userPhone, extraSystem = "" }: any) {
   const today = new Date();
   const tzParts = getZonedParts(today, CLINIC_TIMEZONE);
   const todayStr = `${tzParts.year}-${String(tzParts.month).padStart(2, "0")}-${String(tzParts.day).padStart(2, "0")}`;
@@ -1071,59 +1234,34 @@ Tel usuario: ${userPhone}.
   const msg = resp.data.choices?.[0]?.message;
 
   if (msg?.tool_calls?.length) {
-    const toolResults = [];
+    const toolResults: any[] = [];
     for (const tc of msg.tool_calls) {
       const name = tc.function.name;
       const args = JSON.parse(tc.function.arguments || "{}");
 
       if (name === "get_available_slots") {
         const slots = await getAvailableSlotsTool(args);
-        toolResults.push({
-          tool_call_id: tc.id,
-          role: "tool",
-          name,
-          content: JSON.stringify({ slots }),
-        });
+        toolResults.push({ tool_call_id: tc.id, role: "tool", name, content: JSON.stringify({ slots }) });
       }
 
       if (name === "book_appointment") {
         const booked = await bookAppointmentTool(args);
-        toolResults.push({
-          tool_call_id: tc.id,
-          role: "tool",
-          name,
-          content: JSON.stringify({ booked }),
-        });
+        toolResults.push({ tool_call_id: tc.id, role: "tool", name, content: JSON.stringify({ booked }) });
       }
 
       if (name === "reschedule_appointment") {
         const out = await rescheduleAppointmentTool(args);
-        toolResults.push({
-          tool_call_id: tc.id,
-          role: "tool",
-          name,
-          content: JSON.stringify(out),
-        });
+        toolResults.push({ tool_call_id: tc.id, role: "tool", name, content: JSON.stringify(out) });
       }
 
       if (name === "cancel_appointment") {
         const out = await cancelAppointmentTool(args);
-        toolResults.push({
-          tool_call_id: tc.id,
-          role: "tool",
-          name,
-          content: JSON.stringify(out),
-        });
+        toolResults.push({ tool_call_id: tc.id, role: "tool", name, content: JSON.stringify(out) });
       }
 
       if (name === "handoff_to_human") {
         const out = await handoffToHumanTool(args);
-        toolResults.push({
-          tool_call_id: tc.id,
-          role: "tool",
-          name,
-          content: JSON.stringify(out),
-        });
+        toolResults.push({ tool_call_id: tc.id, role: "tool", name, content: JSON.stringify(out) });
       }
     }
 
@@ -1160,7 +1298,7 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-function extractIncomingText(msg) {
+function extractIncomingText(msg: any) {
   if (!msg) return "";
 
   if (msg?.text?.body) return msg.text.body;
@@ -1175,16 +1313,13 @@ function extractIncomingText(msg) {
     return br.id || br.title || "";
   }
 
-  // Nota de voz / audio
   if (msg?.type === "audio" && msg?.audio?.id) return "[AUDIO]";
 
-  // Ubicación
   if (msg?.type === "location" && msg?.location) {
     const { latitude, longitude, name, address } = msg.location;
     return `📍 Ubicación: ${name || ""} ${address || ""} (${latitude}, ${longitude})`.trim();
   }
 
-  // Imagen / video / documento / sticker
   if (msg?.type === "image" && msg?.image?.id) return "[IMAGE]";
   if (msg?.type === "video" && msg?.video?.id) return "[VIDEO]";
   if (msg?.type === "document" && msg?.document?.id) return "[DOCUMENT]";
@@ -1196,7 +1331,7 @@ function extractIncomingText(msg) {
   return `[${(msg?.type || "UNKNOWN").toUpperCase()}]`;
 }
 
-function detectServiceKeyFromUser(text) {
+function detectServiceKeyFromUser(text: string) {
   const t = normalizeText(text);
 
   if (SERVICE_ID_TO_KEY[text]) return SERVICE_ID_TO_KEY[text];
@@ -1219,10 +1354,7 @@ function detectServiceKeyFromUser(text) {
 }
 
 // =====================================================
-// ✅ NEW: endpoint para recibir mensaje del AGENTE desde BotHub
-// POST /agent_message
-// body: { conversationId, waTo, text, agentUserId }
-// header: X-HUB-SIGNATURE (HMAC)
+// ✅ endpoint para recibir mensaje del AGENTE desde BotHub
 // =====================================================
 app.post("/agent_message", async (req, res) => {
   try {
@@ -1245,17 +1377,18 @@ app.post("/agent_message", async (req, res) => {
     if (!waTo || !String(waTo).trim()) return res.status(400).json({ error: "waTo is required" });
     if (!text || !String(text).trim()) return res.status(400).json({ error: "text is required" });
 
-    // ✅ Enviar por WhatsApp como AGENTE (y reportar al Hub como AGENT)
     await sendWhatsAppText(String(waTo), String(text), "AGENT");
-
     return res.json({ ok: true });
-  } catch (e) {
+  } catch (e: any) {
     console.error("agent_message error:", e?.response?.data || e?.message || e);
     return res.status(500).json({ error: "Internal error" });
   }
 });
 
-app.post("/webhook", async (req, res) => {
+app.post("/webhook", async (req: any, res) => {
+  let from = "";
+  let session: any = null;
+
   try {
     if (!verifyMetaSignature(req)) return res.sendStatus(403);
 
@@ -1266,10 +1399,10 @@ app.post("/webhook", async (req, res) => {
     const msg = value?.messages?.[0];
     if (!msg) return res.sendStatus(200);
 
-    const from = msg.from;
+    from = msg.from;
     if (!from) return res.sendStatus(200);
 
-    const session = getSession(from);
+    session = await getSession(from);
 
     // ✅ dedupe por reintentos de Meta
     const msgId = msg?.id;
@@ -1282,7 +1415,7 @@ app.post("/webhook", async (req, res) => {
 
     if (!userText) return res.sendStatus(200);
 
-    // ✅ Reportar INBOUND al Hub (texto + meta)
+    // ✅ Reportar INBOUND al Hub
     const inboundMeta = extractInboundMeta(msg);
     await bothubReportMessage({
       direction: "INBOUND",
@@ -1294,6 +1427,21 @@ app.post("/webhook", async (req, res) => {
       kind: inboundMeta?.kind || (msg?.type ? String(msg.type).toUpperCase() : "UNKNOWN"),
       meta: inboundMeta,
     });
+
+    // =========================
+    // Si usuario pide cancelar/reprogramar y NO hay lastBooking => buscar en Calendar
+    // =========================
+    const wantsCancel = looksLikeCancel(tNorm) || isChoice(tNorm, 3);
+    const wantsReschedule = looksLikeReschedule(tNorm) || isChoice(tNorm, 2);
+    const wantsConfirm = looksLikeConfirm(tNorm) || isChoice(tNorm, 1);
+
+    if ((wantsCancel || wantsReschedule || wantsConfirm) && !session.lastBooking) {
+      const found = await findUpcomingAppointmentByPhone(from);
+      if (found) {
+        session.lastBooking = found;
+        session.state = "post_booking";
+      }
+    }
 
     // =========================
     // FIX: evitar respuestas múltiples al saludar
@@ -1325,16 +1473,33 @@ app.post("/webhook", async (req, res) => {
       session.greeted = true;
     }
 
-    // -------------------------
+    // =========================
     // POST-BOOKING STATE
-    // -------------------------
+    // =========================
     if (session.state === "post_booking" && session.lastBooking) {
-      if (looksLikeCancel(tNorm)) {
+      // ✅ Confirmar por "1" o "confirmar"
+      if (wantsConfirm) {
+        const b = session.lastBooking;
+        await sendWhatsAppText(
+          from,
+          `✅ ¡Confirmado!\n\n🦷 Servicio: ${
+            SERVICES.find((s) => s.key === b.service)?.title || b.service
+          }\n📅 Fecha: ${formatDateInTZ(b.start, CLINIC_TIMEZONE)}\n⏰ Hora: ${formatTimeInTZ(
+            b.start,
+            CLINIC_TIMEZONE
+          )}\n\nSi necesitas *reprogramar* o *cancelar*, responde:\n2) Reprogramar\n3) Cancelar`
+        );
+        return res.sendStatus(200);
+      }
+
+      if (wantsCancel) {
         await cancelAppointmentTool({ appointment_id: session.lastBooking.appointment_id, reason: userText });
         await sendWhatsAppText(
           from,
           `✅ Listo. Tu cita fue cancelada.\n\nSi deseas agendar una nueva, escribe "Nueva cita" o dime el servicio.`
         );
+
+        // reset
         session.state = "idle";
         session.lastSlots = [];
         session.selectedSlot = null;
@@ -1342,24 +1507,37 @@ app.post("/webhook", async (req, res) => {
         session.pendingRange = null;
         session.pendingName = null;
         session.lastBooking = null;
+        session.reschedule = defaultSession().reschedule;
         return res.sendStatus(200);
       }
 
-      if (looksLikeReschedule(tNorm)) {
-        session.state = "idle";
+      if (wantsReschedule) {
+        // activar modo reprogramación
+        session.reschedule.active = true;
+        session.reschedule.appointment_id = session.lastBooking.appointment_id;
+        session.reschedule.phone = session.lastBooking.phone || String(from).replace(/[^\d]/g, "");
+        session.reschedule.patient_name = session.lastBooking.patient_name || "";
+        session.reschedule.service = session.lastBooking.service || "";
+
+        // mantener el mismo servicio por defecto
+        session.pendingService = session.reschedule.service || session.pendingService;
+        session.state = "await_day";
         session.lastSlots = [];
         session.selectedSlot = null;
-        session.pendingService = null;
         session.pendingRange = null;
         session.pendingName = null;
 
-        await sendWhatsAppText(from, `Perfecto ✅ Vamos a reprogramar.\n¿Cuál servicio deseas (o es el mismo)?`);
-        await sendServicesList(from);
+        const prettyService = SERVICES.find((s) => s.key === session.pendingService)?.title || session.pendingService;
+        await sendWhatsAppText(
+          from,
+          `Perfecto ✅ Vamos a reprogramar tu cita.\nServicio: *${prettyService}*\n\n¿Para qué día?\nEj: "mañana", "viernes", "próximo martes", "la semana que viene" o "14 de junio".`
+        );
         return res.sendStatus(200);
       }
 
       if (looksLikeNewAppointment(tNorm)) {
         session.state = "idle";
+        session.reschedule = defaultSession().reschedule;
         await sendWhatsAppText(from, `Claro ✅ Vamos a agendar una nueva cita.\nElige un servicio:`);
         await sendServicesList(from);
         return res.sendStatus(200);
@@ -1381,14 +1559,14 @@ app.post("/webhook", async (req, res) => {
 
       await sendWhatsAppText(
         from,
-        `Estoy aquí ✅\nSi deseas *reprogramar* o *cancelar* tu cita, escríbelo.\nSi deseas una *nueva cita*, escribe "Nueva cita".`
+        `Estoy aquí ✅\nSi deseas *reprogramar* o *cancelar* tu cita, responde:\n2) Reprogramar\n3) Cancelar\n\nSi deseas una *nueva cita*, escribe "Nueva cita".`
       );
       return res.sendStatus(200);
     }
 
-    // -------------------------
+    // =========================
     // AWAIT SLOT CHOICE
-    // -------------------------
+    // =========================
     if (session.state === "await_slot_choice" && session.lastSlots?.length) {
       const picked = tryPickSlotFromUserText(session, userText);
       if (!picked) {
@@ -1398,6 +1576,52 @@ app.post("/webhook", async (req, res) => {
         );
         return res.sendStatus(200);
       }
+
+      // ✅ Si estamos reprogramando, NO pedimos nombre/teléfono, reprogramamos directo
+      if (session.reschedule?.active && session.reschedule.appointment_id) {
+        const appointment_id = session.reschedule.appointment_id;
+        const nextService = session.pendingService || picked.service || session.reschedule.service;
+
+        await rescheduleAppointmentTool({
+          appointment_id,
+          new_slot_id: picked.slot_id,
+          new_start: picked.start,
+          new_end: picked.end,
+          service: nextService,
+          patient_name: session.reschedule.patient_name,
+          phone: session.reschedule.phone || from,
+        });
+
+        const prettyService = SERVICES.find((s) => s.key === nextService)?.title || nextService;
+
+        // actualizar lastBooking
+        session.lastBooking = {
+          appointment_id,
+          start: picked.start,
+          end: picked.end,
+          service: nextService,
+          patient_name: session.reschedule.patient_name || session.lastBooking?.patient_name || "",
+          phone: session.reschedule.phone || String(from).replace(/[^\d]/g, ""),
+        };
+
+        session.state = "post_booking";
+        session.lastSlots = [];
+        session.selectedSlot = null;
+        session.pendingRange = null;
+        session.pendingName = null;
+        session.reschedule = defaultSession().reschedule;
+
+        await sendWhatsAppText(
+          from,
+          `✅ *Cita reprogramada*\n\n🦷 Servicio: *${prettyService}*\n📅 Fecha: *${formatDateInTZ(
+            picked.start,
+            CLINIC_TIMEZONE
+          )}*\n⏰ Hora: *${formatTimeInTZ(picked.start, CLINIC_TIMEZONE)}*\n\nResponde:\n1) Confirmar\n2) Reprogramar\n3) Cancelar`
+        );
+        return res.sendStatus(200);
+      }
+
+      // flujo normal (nueva cita)
       session.selectedSlot = picked;
       session.state = "await_name";
       await sendWhatsAppText(
@@ -1407,9 +1631,9 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // -------------------------
+    // =========================
     // AWAIT NAME
-    // -------------------------
+    // =========================
     if (session.state === "await_name" && session.selectedSlot) {
       if (tNorm.length < 3 || ["si", "sí", "ok", "listo"].includes(tNorm)) {
         await sendWhatsAppText(from, `Por favor, envíame tu *nombre completo* 🙂`);
@@ -1421,9 +1645,9 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // -------------------------
+    // =========================
     // AWAIT PHONE -> BOOK
-    // -------------------------
+    // =========================
     if (session.state === "await_phone" && session.selectedSlot && session.pendingName) {
       const phoneDigits = userText.replace(/[^\d]/g, "");
       if (phoneDigits.length < 8) {
@@ -1446,10 +1670,9 @@ app.post("/webhook", async (req, res) => {
 
       await sendWhatsAppText(
         from,
-        `✅ *Cita reservada*\n\n🦷 Servicio: *${prettyService}*\n👤 Paciente: *${booked.patient_name}*\n📞 Teléfono: *${phoneDigits}*\n📅 Fecha: *${formatDateInTZ(booked.start, CLINIC_TIMEZONE)}*\n⏰ Hora: *${formatTimeInTZ(booked.start, CLINIC_TIMEZONE)}*\n📍 Dirección: ${CLINIC_ADDRESS || "—"}\n\nSi deseas *reprogramar* o *cancelar*, escríbelo aquí.`
+        `✅ *Cita reservada*\n\n🦷 Servicio: *${prettyService}*\n👤 Paciente: *${booked.patient_name}*\n📞 Teléfono: *${phoneDigits}*\n📅 Fecha: *${formatDateInTZ(booked.start, CLINIC_TIMEZONE)}*\n⏰ Hora: *${formatTimeInTZ(booked.start, CLINIC_TIMEZONE)}*\n📍 Dirección: ${CLINIC_ADDRESS || "—"}\n\nResponde:\n1) Confirmar\n2) Reprogramar\n3) Cancelar`
       );
 
-      // ✅ NEW: réplica del resumen a tu WhatsApp personal (sin tocar el flujo existente)
       await notifyPersonalWhatsAppBookingSummary(booked);
 
       session.lastBooking = booked;
@@ -1458,13 +1681,14 @@ app.post("/webhook", async (req, res) => {
       session.selectedSlot = null;
       session.pendingName = null;
       session.pendingRange = null;
+      session.reschedule = defaultSession().reschedule;
 
       return res.sendStatus(200);
     }
 
-    // -------------------------
+    // =========================
     // Services menu ask
-    // -------------------------
+    // =========================
     if (
       tNorm.includes("servicios") ||
       tNorm.includes("cuales servicios") ||
@@ -1478,9 +1702,9 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // -------------------------
+    // =========================
     // Detect service and date range
-    // -------------------------
+    // =========================
     const serviceKey = detectServiceKeyFromUser(userText);
 
     if (serviceKey === "urgencias") {
@@ -1498,12 +1722,14 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // If service detected, try parse date
+    // Si service detectado, intentamos rango
     if (serviceKey) {
+      // ✅ Si estamos reprogramando y el usuario cambió de servicio, lo respetamos
+      session.pendingService = serviceKey;
+
       const range = parseDateRangeFromText(userText);
 
       if (!range) {
-        session.pendingService = serviceKey;
         session.state = "await_day";
         await sendWhatsAppText(
           from,
@@ -1519,12 +1745,10 @@ app.post("/webhook", async (req, res) => {
           from,
           `No veo espacios disponibles para ese rango 🙏\nDime otro día (ej: "próximo viernes") o un mes (ej: "en junio").`
         );
-        session.pendingService = serviceKey;
         session.state = "await_day";
         return res.sendStatus(200);
       }
 
-      session.pendingService = serviceKey;
       session.pendingRange = range;
       session.lastSlots = slots;
       session.state = "await_slot_choice";
@@ -1534,7 +1758,7 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // If they answered a day and we have a pending service
+    // Si responde un día y hay pendingService
     if (!serviceKey && session.pendingService) {
       const range = parseDateRangeFromText(userText);
       if (range) {
@@ -1566,10 +1790,11 @@ app.post("/webhook", async (req, res) => {
       }
     }
 
-    // -------------------------
+    // =========================
     // Fallback: OpenAI
-    // -------------------------
+    // =========================
     const reply = await callOpenAI({
+      session,
       userId: from,
       userText,
       userPhone: from,
@@ -1585,13 +1810,22 @@ app.post("/webhook", async (req, res) => {
 
     await sendWhatsAppText(from, reply);
     return res.sendStatus(200);
-  } catch (e) {
+  } catch (e: any) {
     console.error("Webhook error:", e?.message || e);
     return res.sendStatus(200);
+  } finally {
+    try {
+      if (from && session) await saveSession(from, session);
+    } catch (e: any) {
+      console.error("saveSession error:", e?.message || e);
+    }
   }
 });
 
 app.get("/", (_req, res) => res.send("OK"));
+
+// ✅ Health para UptimeRobot
+app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 // =========================
 // Recordatorios (24h y 2h)
@@ -1601,7 +1835,6 @@ async function reminderLoop() {
     const calendar = getCalendarClient();
     const now = new Date();
     const in26h = addMinutes(now, 26 * 60);
-    const in3h = addMinutes(now, 3 * 60);
 
     const list = await calendar.events.list({
       calendarId: GOOGLE_CALENDAR_ID,
@@ -1654,12 +1887,20 @@ async function reminderLoop() {
         });
       }
     }
-  } catch (e) {
+  } catch (e: any) {
     console.error("Reminder loop error:", e?.message || e);
   }
 }
 
-// cada 5 minutos
+// ✅ Tick para ejecutar recordatorios por ping (ideal si el server “duerme”)
+app.get("/tick", async (_req, res) => {
+  try {
+    await reminderLoop();
+  } catch {}
+  return res.status(200).send("tick ok");
+});
+
+// (Se mantiene) cada 5 minutos
 setInterval(reminderLoop, 5 * 60 * 1000);
 
 // =========================
