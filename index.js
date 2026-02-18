@@ -1688,7 +1688,7 @@ app.post("/webhook", async (req, res) => {
         const prettyService = SERVICES.find((s) => s.key === session.pendingService)?.title || session.pendingService;
         await sendWhatsAppText(
           from,
-          `Perfecto ✅ Vamos a reprogramar tu cita.\nServicio: *${prettyService}*\n\n¿Para qué día?\nEj: "mañana", "viernes", "próximo martes", "la semana que viene" o "14 de junio".`
+          `Perfecto ✅ Vamos a reprogramar tu cita.\nServicio: *${prettyService}*\n\n¿Para qué día?\nEj: "mañana", "viernes", "próximo martes".`
         );
         return res.sendStatus(200);
       }
