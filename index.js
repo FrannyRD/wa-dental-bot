@@ -48,8 +48,8 @@ const PERSONAL_WA_TO = (process.env.PERSONAL_WA_TO || "").trim();
 // =========================
 // ✅ BOTHUB (para ver todo en el Hub)
 // =========================
-const BOTHUB_WEBHOOK_URL = process.env.BOTHUB_WEBHOOK_URL || "";
-const BOTHUB_WEBHOOK_SECRET = process.env.BOTHUB_WEBHOOK_SECRET || "";
+const BOTHUB_WEBHOOK_URL = (process.env.BOTHUB_WEBHOOK_URL || "").trim();
+const BOTHUB_WEBHOOK_SECRET = (process.env.BOTHUB_WEBHOOK_SECRET || "").trim();
 const BOTHUB_TIMEOUT_MS = Number(process.env.BOTHUB_TIMEOUT_MS || 6000);
 
 // ✅ NEW: media proxy para BotHub (sin tocar lo demás)
@@ -184,6 +184,22 @@ function stableStringify(obj) {
   return `{${keys.map((k) => JSON.stringify(k) + ":" + stableStringify(obj[k])).join(",")}}`;
 }
 
+function removeUndefinedDeep(value) {
+  if (Array.isArray(value)) {
+    return value.map(removeUndefinedDeep);
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([, v]) => v !== undefined)
+        .map(([k, v]) => [k, removeUndefinedDeep(v)])
+    );
+  }
+
+  return value;
+}
+
 function bothubHmacStable(payload, secret) {
   const raw = stableStringify(payload);
   return crypto.createHmac("sha256", secret).update(raw).digest("hex");
@@ -231,13 +247,17 @@ async function bothubReportMessage(payload) {
   if (!BOTHUB_WEBHOOK_URL || !BOTHUB_WEBHOOK_SECRET) return;
 
   try {
-    const sig = bothubHmacStable(payload, BOTHUB_WEBHOOK_SECRET);
-    await axios.post(BOTHUB_WEBHOOK_URL, payload, {
+    const cleanPayload = removeUndefinedDeep(payload);
+    const raw = stableStringify(cleanPayload);
+    const sig = crypto.createHmac("sha256", BOTHUB_WEBHOOK_SECRET).update(raw).digest("hex");
+
+    await axios.post(BOTHUB_WEBHOOK_URL, raw, {
       headers: {
         "Content-Type": "application/json",
         "X-HUB-SIGNATURE": sig,
       },
       timeout: BOTHUB_TIMEOUT_MS,
+      transformRequest: [(data) => data],
     });
   } catch (e) {
     console.error("Bothub report failed:", e?.response?.data || e?.message || e);
