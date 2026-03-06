@@ -1788,6 +1788,21 @@ app.post("/webhook", async (req, res) => {
     const inboundMeta = extractInboundMeta(msg);
     const inboundMetaWithMediaUrl = attachHubMediaUrl(req, inboundMeta);
 
+    console.log(
+      "BOTHUB INBOUND DEBUG: ",
+      JSON.stringify(
+        {
+          msgType: msg?.type,
+          from,
+          userText,
+          inboundMeta,
+          inboundMetaWithMediaUrl,
+        },
+        null,
+        2
+      )
+    );
+
     await bothubReportMessage({
       direction: "INBOUND",
       from: String(from),
