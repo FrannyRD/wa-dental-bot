@@ -52,6 +52,14 @@ const BOTHUB_WEBHOOK_URL = process.env.BOTHUB_WEBHOOK_URL || "";
 const BOTHUB_WEBHOOK_SECRET = process.env.BOTHUB_WEBHOOK_SECRET || "";
 const BOTHUB_TIMEOUT_MS = Number(process.env.BOTHUB_TIMEOUT_MS || 6000);
 
+// ✅ NEW: media proxy para BotHub (sin tocar lo demás)
+const BOT_PUBLIC_BASE_URL = (process.env.BOT_PUBLIC_BASE_URL || "").replace(/\/$/, "");
+const HUB_MEDIA_SECRET =
+  (process.env.HUB_MEDIA_SECRET || BOTHUB_WEBHOOK_SECRET || VERIFY_TOKEN || "").trim();
+const HUB_MEDIA_TTL_SEC = parseInt(process.env.HUB_MEDIA_TTL_SEC || "900", 10); // 15 min
+const META_GRAPH_VERSION =
+  process.env.WHATSAPP_GRAPH_VERSION || process.env.META_GRAPH_VERSION || "v23.0";
+
 // =========================
 // ✅ PERSISTENCIA (REDIS)
 // =========================
@@ -292,6 +300,150 @@ function extractInboundMeta(msg) {
     return { kind: "REACTION", emoji: msg?.reaction?.emoji, messageId: msg?.reaction?.message_id };
 
   return { kind: msg?.type ? String(msg.type).toUpperCase() : "UNKNOWN" };
+}
+
+// =========================
+// ✅ NEW: media proxy helpers (solo agregado)
+// =========================
+function extFromMimeType(mime) {
+  const m = String(mime || "").toLowerCase();
+  if (m.includes("audio/ogg")) return ".ogg";
+  if (m.includes("audio/mpeg") || m.includes("audio/mp3")) return ".mp3";
+  if (m.includes("audio/wav")) return ".wav";
+  if (m.includes("audio/webm")) return ".webm";
+  if (m.includes("image/jpeg")) return ".jpg";
+  if (m.includes("image/png")) return ".png";
+  if (m.includes("image/gif")) return ".gif";
+  if (m.includes("image/webp")) return ".webp";
+  if (m.includes("video/mp4")) return ".mp4";
+  if (m.includes("application/pdf")) return ".pdf";
+  if (m.includes("word")) return ".docx";
+  if (m.includes("sheet")) return ".xlsx";
+  if (m.includes("presentation")) return ".pptx";
+  return "";
+}
+
+function sanitizeFileName(name, fallback = "file") {
+  const raw = String(name || fallback).trim() || fallback;
+  return raw.replace(/[\\/:*?"<>|]+/g, "_");
+}
+
+function getRequestBaseUrl(req) {
+  const proto = String(req.headers["x-forwarded-proto"] || req.protocol || "https")
+    .split(",")[0]
+    .trim();
+  const host = String(req.headers["x-forwarded-host"] || req.get("host") || "")
+    .split(",")[0]
+    .trim();
+
+  if (!host) return BOT_PUBLIC_BASE_URL || "";
+  return `${proto}://${host}`;
+}
+
+function getBotPublicBaseUrl(req) {
+  return BOT_PUBLIC_BASE_URL || getRequestBaseUrl(req);
+}
+
+function signHubMediaToken(mediaId, ts) {
+  if (!HUB_MEDIA_SECRET) return "";
+  return crypto
+    .createHmac("sha256", HUB_MEDIA_SECRET)
+    .update(`${String(mediaId)}:${String(ts)}`)
+    .digest("hex");
+}
+
+function verifyHubMediaToken(mediaId, ts, sig) {
+  if (!HUB_MEDIA_SECRET) return false;
+  if (!mediaId || !ts || !sig) return false;
+
+  const tsNum = Number(ts);
+  if (!Number.isFinite(tsNum)) return false;
+
+  const ageMs = Math.abs(Date.now() - tsNum);
+  if (ageMs > HUB_MEDIA_TTL_SEC * 1000) return false;
+
+  const expected = signHubMediaToken(mediaId, ts);
+  return timingSafeEqualHex(sig, expected);
+}
+
+function buildHubMediaUrl(req, mediaId) {
+  if (!mediaId) return "";
+  if (!HUB_MEDIA_SECRET) return "";
+
+  const base = getBotPublicBaseUrl(req);
+  if (!base) return "";
+
+  const ts = String(Date.now());
+  const sig = signHubMediaToken(mediaId, ts);
+
+  return `${base.replace(/\/$/, "")}/hub_media/${encodeURIComponent(mediaId)}?ts=${encodeURIComponent(
+    ts
+  )}&sig=${encodeURIComponent(sig)}`;
+}
+
+function attachHubMediaUrl(req, meta) {
+  const out = { ...(meta || {}) };
+  const kind = String(out?.kind || "").toUpperCase();
+
+  if (
+    out?.mediaId &&
+    ["AUDIO", "IMAGE", "VIDEO", "DOCUMENT", "STICKER"].includes(kind)
+  ) {
+    const mediaUrl = buildHubMediaUrl(req, out.mediaId);
+    if (mediaUrl) out.mediaUrl = mediaUrl;
+  }
+
+  return out;
+}
+
+async function getMetaMediaInfo(mediaId) {
+  if (!WA_TOKEN) throw new Error("WA_TOKEN not configured");
+  const res = await axios.get(
+    `https://graph.facebook.com/${META_GRAPH_VERSION}/${encodeURIComponent(mediaId)}`,
+    {
+      headers: { Authorization: `Bearer ${WA_TOKEN}` },
+      timeout: 30000,
+      validateStatus: () => true,
+    }
+  );
+
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error(
+      res?.data?.error?.message ||
+        res?.data?.error?.error_user_msg ||
+        `Meta media lookup failed (${res.status})`
+    );
+  }
+
+  return res.data || {};
+}
+
+async function downloadMetaMedia(mediaId) {
+  const info = await getMetaMediaInfo(mediaId);
+  const mediaUrl = info?.url;
+  const mimeType = info?.mime_type || "application/octet-stream";
+
+  if (!mediaUrl) throw new Error("Meta respondió sin url para ese mediaId");
+
+  const bin = await axios.get(mediaUrl, {
+    headers: { Authorization: `Bearer ${WA_TOKEN}` },
+    responseType: "arraybuffer",
+    timeout: 60000,
+    validateStatus: () => true,
+  });
+
+  if (bin.status < 200 || bin.status >= 300) {
+    throw new Error(
+      typeof bin.data === "string"
+        ? bin.data
+        : `Meta media download failed (${bin.status})`
+    );
+  }
+
+  return {
+    buffer: Buffer.from(bin.data),
+    mimeType,
+  };
 }
 
 // =========================
@@ -1558,6 +1710,52 @@ app.post("/agent_message", async (req, res) => {
   }
 });
 
+// =====================================================
+// ✅ NEW: media proxy para BotHub
+// - El CRM NO necesita WA_TOKEN
+// - El bot usa SU propio WA_TOKEN para traer audio/doc/imagen
+// =====================================================
+app.get("/hub_media/:mediaId", async (req, res) => {
+  try {
+    const { mediaId } = req.params || {};
+    const ts = String(req.query?.ts || "");
+    const sig = String(req.query?.sig || "");
+
+    if (!mediaId) {
+      return res.status(400).json({ error: "mediaId is required" });
+    }
+
+    if (!verifyHubMediaToken(mediaId, ts, sig)) {
+      return res.status(401).json({ error: "Invalid or expired media signature" });
+    }
+
+    if (!WA_TOKEN) {
+      return res.status(500).json({ error: "WA_TOKEN not configured in bot" });
+    }
+
+    const info = await getMetaMediaInfo(mediaId);
+    const mimeType = String(info?.mime_type || "application/octet-stream");
+    const filename = sanitizeFileName(
+      info?.filename || `media-${mediaId}${extFromMimeType(mimeType)}`,
+      `media-${mediaId}${extFromMimeType(mimeType)}`
+    );
+
+    const downloaded = await downloadMetaMedia(mediaId);
+
+    res.setHeader("Content-Type", downloaded.mimeType || mimeType);
+    res.setHeader("Cache-Control", "private, max-age=300");
+    res.setHeader("Content-Disposition", `inline; filename="${String(filename).replace(/"/g, "")}"`);
+
+    return res.status(200).send(downloaded.buffer);
+  } catch (e) {
+    console.error("hub_media error:", e?.response?.data || e?.message || e);
+    return res.status(500).json({
+      error: "hub_media_failed",
+      detail: e?.response?.data || e?.message || "unknown",
+    });
+  }
+});
+
 app.post("/webhook", async (req, res) => {
   let from = "";
   let session = null;
@@ -1588,6 +1786,8 @@ app.post("/webhook", async (req, res) => {
     if (!userText) return res.sendStatus(200);
 
     const inboundMeta = extractInboundMeta(msg);
+    const inboundMetaWithMediaUrl = attachHubMediaUrl(req, inboundMeta);
+
     await bothubReportMessage({
       direction: "INBOUND",
       from: String(from),
@@ -1595,8 +1795,9 @@ app.post("/webhook", async (req, res) => {
       source: "WHATSAPP",
       waMessageId: msg?.id,
       name: value?.contacts?.[0]?.profile?.name,
-      kind: inboundMeta?.kind || (msg?.type ? String(msg.type).toUpperCase() : "UNKNOWN"),
-      meta: inboundMeta,
+      kind: inboundMetaWithMediaUrl?.kind || (msg?.type ? String(msg.type).toUpperCase() : "UNKNOWN"),
+      meta: inboundMetaWithMediaUrl,
+      mediaUrl: inboundMetaWithMediaUrl?.mediaUrl || undefined,
     });
 
     const wantsCancel = looksLikeCancel(tNorm) || isChoice(tNorm, 3);
