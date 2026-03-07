@@ -1786,6 +1786,20 @@ app.post("/webhook", async (req, res) => {
     const entry = req.body.entry?.[0];
     const change = entry?.changes?.[0];
     const value = change?.value;
+    const incomingPhoneNumberId = String(value?.metadata?.phone_number_id || "").trim();
+const incomingDisplayPhone = String(value?.metadata?.display_phone_number || "").trim();
+const expectedPhoneNumberId = String(PHONE_NUMBER_ID || "").trim();
+
+console.log("[WEBHOOK FILTER]", {
+  expectedPhoneNumberId,
+  incomingPhoneNumberId,
+  incomingDisplayPhone,
+});
+
+if (incomingPhoneNumberId && expectedPhoneNumberId && incomingPhoneNumberId !== expectedPhoneNumberId) {
+  console.log("[WEBHOOK FILTER] Ignorado por phone_number_id distinto");
+  return res.sendStatus(200);
+}
 
     const msg = value?.messages?.[0];
     if (!msg) return res.sendStatus(200);
